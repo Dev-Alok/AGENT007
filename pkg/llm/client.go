@@ -7,16 +7,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
 )
 
 // Client handles HTTP communication with Ollama or OpenAI-compatible APIs (LM Studio).
-// Implements raw JSON-RPC/HTTP logic for maximum control (no heavy wrappers).
 type Client struct {
 	baseURL    string
+	apiKey     string
 	httpClient *http.Client
 	mu         sync.RWMutex // Protects client state during reconnection
 	apiType    APIType      // Ollama or OpenAI format
@@ -31,7 +30,6 @@ const (
 )
 
 // ChatRequest represents the request format for Ollama chat endpoint.
-// Using explicit structs instead of json.RawMessage for type safety.
 type ChatRequest struct {
 	Model    string    `json:"model"`
 	Messages []Message `json:"messages"`
@@ -66,7 +64,7 @@ type Format struct {
 
 // ResponseFormat specifies JSON response format - OpenAI/LM Studio format.
 type ResponseFormat struct {
-	Type string `json:"type"` // "json_object"
+	Type string `json:"type"` // "json_schema"
 }
 
 // ChatResponse represents the response from Ollama.
@@ -115,14 +113,128 @@ type ToolCall struct {
 }
 
 // NewClient creates a new client for Ollama API.
-func NewClient(baseURL string) *Client {
+func NewClient(baseURL, apiKey string) *Client {
 	return &Client{
 		baseURL: baseURL,
+		apiKey:  apiKey,
 		apiType: APIOllama,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second, // Prevent indefinite hangs
 		},
 	}
+}
+
+// NewClientWithAPIType creates a new client with specified API type.
+func NewClientWithAPIType(baseURL, apiKey string, apiType APIType) *Client {
+	return &Client{
+		baseURL: baseURL,
+		apiKey:  apiKey,
+		apiType: apiType,
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+	}
+}
+
+// NewClientWithTimeout creates a new client with custom timeout.
+func NewClientWithTimeout(baseURL, apiKey string, timeout time.Duration) *Client {
+	return &Client{
+		baseURL: baseURL,
+		apiKey:  apiKey,
+		apiType: APIOllama,
+		httpClient: &http.Client{
+			Timeout: timeout,
+		},
+	}
+}
+
+// NewClientWithTimeoutAndAPIType creates a new client with custom timeout and API type.
+func NewClientWithTimeoutAndAPIType(baseURL, apiKey string, apiType APIType, timeout time.Duration) *Client {
+	return &Client{
+		baseURL: baseURL,
+		apiKey:  apiKey,
+		apiType: apiType,
+		httpClient: &http.Client{
+			Timeout: timeout,
+		},
+	}
+}
+
+// SetAPIType allows changing the API type at runtime.
+func (c *Client) SetAPIType(apiType APIType) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.apiType = apiType
+}
+
+// HealthCheck verifies that the LLM server is running and accessible.
+// Returns true if server is healthy, false otherwise.
+func (c *Client) HealthCheck(ctx context.Context) error {
+	c.mu.RLock()
+	client := c.httpClient
+	apiType := c.apiType
+	apiKey := c.apiKey
+	c.mu.RUnlock()
+
+	var healthPath string
+	if apiType == APIOpenAI {
+		healthPath = "/v1/models"
+	} else {
+		healthPath = "/api/tags"
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+healthPath, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create health check request: %w", err)
+	}
+
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to connect to server: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server returned status %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// RetryChat sends a message with retry logic and exponential backoff.
+// Retries up to maxRetries times with increasing delays.
+func (c *Client) RetryChat(ctx context.Context, model string, messages []Message, useJSONMode bool, maxRetries int) (*ChatResponse, error) {
+	var lastErr error
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 1s, 2s, 4s, 8s, etc.
+			delay := time.Duration(1<<uint(attempt-1)) * time.Second
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+
+		response, err := c.Chat(ctx, model, messages, useJSONMode)
+		if err == nil {
+			return response, nil
+		}
+
+		lastErr = err
+
+		// Don't retry on timeout or context cancellation
+		if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "context") {
+			break
+		}
+	}
+
+	return nil, fmt.Errorf("after %d attempts: %w", maxRetries+1, lastErr)
 }
 
 // Chat sends a message to the LLM and returns the response.
@@ -163,6 +275,9 @@ func (c *Client) chatOllama(ctx context.Context, client *http.Client, model stri
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
@@ -202,7 +317,10 @@ func (c *Client) chatOpenAI(ctx context.Context, client *http.Client, model stri
 	}
 
 	if useJSONMode {
-		req.ResponseFormat = &ResponseFormat{Type: "json_object"}
+		// Note: The specific json_schema config may require defining the actual schema tree structure based on LM Studio version
+		// but providing the type as json_schema fulfills the type requirement check initially.
+		// Older/more robust LM studios might natively fall back to generic schema if omitted.
+		req.ResponseFormat = &ResponseFormat{Type: "json_schema"}
 	}
 
 	jsonData, err := json.MarshalIndent(req, "", "  ")
@@ -210,14 +328,15 @@ func (c *Client) chatOpenAI(ctx context.Context, client *http.Client, model stri
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "[DEBUG] OpenAI Request:\n%s\n", string(jsonData))
-
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/v1/chat/completions", strings.NewReader(string(jsonData)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
@@ -231,27 +350,19 @@ func (c *Client) chatOpenAI(ctx context.Context, client *http.Client, model stri
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		fmt.Fprintf(os.Stderr, "[DEBUG] HTTP Status: %d\n", resp.StatusCode)
-		fmt.Fprintf(os.Stderr, "[DEBUG] Response body: %s\n", string(body))
 		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
 	}
 
 	var openAIResp OpenAIChatResponse
 	if err := json.Unmarshal(body, &openAIResp); err != nil {
-		fmt.Fprintf(os.Stderr, "[DEBUG] JSON parse error: %v\n", err)
-		fmt.Fprintf(os.Stderr, "[DEBUG] Raw body: %s\n", string(body))
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "[DEBUG] Parsed response - Choices: %d, Model: %s\n", len(openAIResp.Choices), openAIResp.Model)
-
 	if len(openAIResp.Choices) == 0 {
-		fmt.Fprintf(os.Stderr, "[DEBUG] No choices in response\n")
 		return nil, fmt.Errorf("empty response from API")
 	}
 
 	content := openAIResp.Choices[0].Message.Content
-	fmt.Fprintf(os.Stderr, "[DEBUG] Content length: %d chars\n", len(content))
 
 	// Convert OpenAI response to standard ChatResponse format
 	return &ChatResponse{
@@ -300,6 +411,9 @@ func (c *Client) StreamChat(ctx context.Context, model string, messages []Messag
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
@@ -358,38 +472,76 @@ func (c *Client) StreamChat(ctx context.Context, model string, messages []Messag
 	}
 }
 
-// ParseToolCall attempts to parse a tool call from LLM text output.
-// Uses JSON parsing first, falls back to regex for unstructured responses.
-func ParseToolCall(text string) (*ToolCall, error) {
+// ParseToolCalls extracts all valid tool-call JSON objects from LLM text output.
+// Uses brace-depth tracking instead of regex to correctly handle nested JSON (e.g. args with objects).
+func ParseToolCalls(text string) ([]ToolCall, error) {
 	text = strings.TrimSpace(text)
+	var calls []ToolCall
 
-	// Try direct JSON parsing (preferred when using JSON mode)
-	var toolCall ToolCall
-	if err := json.Unmarshal([]byte(text), &toolCall); err == nil {
-		if toolCall.Tool != "" {
-			return &toolCall, nil
+	// Extract all top-level JSON objects using brace-depth tracking
+	jsonBlocks := extractJSONBlocks(text)
+
+	for _, block := range jsonBlocks {
+		var tc ToolCall
+		if err := json.Unmarshal([]byte(block), &tc); err == nil && tc.Tool != "" {
+			calls = append(calls, tc)
 		}
 	}
 
-	// Fallback: Try to extract JSON object from text
-	jsonStart := strings.Index(text, "{")
-	jsonEnd := strings.LastIndex(text, "}")
-	if jsonStart >= 0 && jsonEnd > jsonStart {
-		jsonStr := text[jsonStart : jsonEnd+1]
-		var toolCall ToolCall
-		if err := json.Unmarshal([]byte(jsonStr), &toolCall); err == nil {
-			if toolCall.Tool != "" {
-				return &toolCall, nil
+	if len(calls) == 0 {
+		return nil, fmt.Errorf("no valid tool call found in response")
+	}
+
+	return calls, nil
+}
+
+// extractJSONBlocks finds all top-level JSON objects in a string using brace-depth tracking.
+// This correctly handles nested objects like {"tool": "x", "args": {"path": "y"}}.
+func extractJSONBlocks(text string) []string {
+	var blocks []string
+	depth := 0
+	start := -1
+
+	for i, ch := range text {
+		switch ch {
+		case '{':
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		case '}':
+			depth--
+			if depth == 0 && start >= 0 {
+				blocks = append(blocks, text[start:i+1])
+				start = -1
 			}
 		}
 	}
 
-	return nil, fmt.Errorf("no valid tool call found in response: %s", text)
+	return blocks
 }
 
-// BuildSystemPrompt creates a system prompt that enforces structured output.
-// Critical for getting reliable JSON responses from the LLM.
+// BuildSystemPrompt creates an intelligent system prompt with chain-of-thought reasoning.
 func BuildSystemPrompt(tools []string) string {
 	toolList := strings.Join(tools, ", ")
-	return fmt.Sprintf("You are an autonomous coding agent with access to the following tools: %s.\n\nWhen you need to use a tool, respond ONLY with a valid JSON object in this exact format:\n{\"tool\": \"tool_name\", \"args\": {\"arg1\": \"value1\", \"arg2\": \"value2\"}}\n\nRules:\n1. NEVER include markdown formatting (no ```json blocks)\n2. NEVER add explanations before or after the JSON\n3. ALWAYS use valid JSON syntax with double quotes\n4. If you need to call a tool, return ONLY the JSON object\n5. When your task is complete and no further tools are needed, respond with DONE_TASK_COMPLETE\n\nAvailable tools: %s", toolList, toolList)
+	return fmt.Sprintf(`You are an autonomous AI coding agent. You have access to the following tools: %s.
+
+Your workflow is:
+1. THINK about what you need to do step by step.
+2. Call ONE tool at a time to gather information or make changes.
+3. OBSERVE the result of the tool call.
+4. Repeat until the task is complete.
+
+When you need to use a tool, respond with ONLY a single valid JSON object:
+{"tool": "tool_name", "args": {"arg1": "value1"}}
+
+CRITICAL RULES:
+- Call only ONE tool per response. Wait for its result before calling the next.
+- NEVER include explanations, markdown, or any text alongside the JSON.
+- ALWAYS use valid JSON with double quotes.
+- Use absolute or relative paths from the current working directory.
+- When you are DONE and have gathered enough information to answer, respond with DONE_TASK_COMPLETE followed by your final answer on the next line.
+- If the user asks a question that does NOT require tools, respond with DONE_TASK_COMPLETE followed by your answer.
+
+Available tools: %s`, toolList, toolList)
 }

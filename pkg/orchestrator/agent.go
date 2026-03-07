@@ -2,10 +2,12 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"agentic-coder/pkg/llm"
 	"agentic-coder/pkg/tools"
@@ -34,10 +36,22 @@ type Message struct {
 
 // NewAgent creates a new agent with the specified tool registry, LLM endpoint, and model.
 // contextWindow limits token usage to prevent runaway costs (performance optimization).
-func NewAgent(registry *tools.Registry, contextWindow int, llmEndpoint, model string) *Agent {
+func NewAgent(registry *tools.Registry, contextWindow int, llmEndpoint, apiKey, model string) *Agent {
 	return &Agent{
 		registry:           registry,
-		llmClient:          llm.NewClient(llmEndpoint), // Supports both Ollama and LM Studio
+		llmClient:          llm.NewClient(llmEndpoint, apiKey), // Supports both Ollama and LM Studio
+		model:              model,
+		contextWindow:      contextWindow,
+		maxIterations:      5, // Prevent infinite loops
+		reflectionAttempts: make(map[string]int),
+	}
+}
+
+// NewAgentWithTimeout creates a new agent with custom timeout.
+func NewAgentWithTimeout(registry *tools.Registry, contextWindow int, llmEndpoint, apiKey, model string, timeout time.Duration) *Agent {
+	return &Agent{
+		registry:           registry,
+		llmClient:          llm.NewClientWithTimeout(llmEndpoint, apiKey, timeout),
 		model:              model,
 		contextWindow:      contextWindow,
 		maxIterations:      5, // Prevent infinite loops
@@ -47,13 +61,22 @@ func NewAgent(registry *tools.Registry, contextWindow int, llmEndpoint, model st
 
 // NewAgentWithAPIType creates a new agent with explicit API type selection.
 // Use this when you need to specify OpenAI-compatible format (LM Studio) vs Ollama.
-func NewAgentWithAPIType(registry *tools.Registry, contextWindow int, llmEndpoint, model string, apiType llm.APIType) *Agent {
-	var client *llm.Client
-	if apiType == llm.APIOpenAI {
-		client = llm.NewClient(llmEndpoint) // Reuse NewClient with OpenAI mode
-	} else {
-		client = llm.NewClient(llmEndpoint)
+func NewAgentWithAPIType(registry *tools.Registry, contextWindow int, llmEndpoint, apiKey, model string, apiType llm.APIType) *Agent {
+	client := llm.NewClientWithAPIType(llmEndpoint, apiKey, apiType)
+
+	return &Agent{
+		registry:           registry,
+		llmClient:          client,
+		model:              model,
+		contextWindow:      contextWindow,
+		maxIterations:      50, // Prevent infinite loops
+		reflectionAttempts: make(map[string]int),
 	}
+}
+
+// NewAgentWithTimeoutAndAPIType creates a new agent with custom timeout and API type.
+func NewAgentWithTimeoutAndAPIType(registry *tools.Registry, contextWindow int, llmEndpoint, apiKey, model string, apiType llm.APIType, timeout time.Duration) *Agent {
+	client := llm.NewClientWithTimeoutAndAPIType(llmEndpoint, apiKey, apiType, timeout)
 
 	return &Agent{
 		registry:           registry,
@@ -78,10 +101,24 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 	// Initialize conversation with system prompt and user task
 	systemPrompt := llm.BuildSystemPrompt(a.registry.List())
 
+	// Add working directory context
+	cwd, err := os.Getwd()
+	if err == nil {
+		systemPrompt += fmt.Sprintf("\n\nCurrent working directory: %s", cwd)
+	}
+
 	a.mu.Lock()
-	a.conversation = []Message{
-		{Role: "system", Content: systemPrompt},
-		{Role: "user", Content: task},
+	if len(a.conversation) == 0 {
+		a.conversation = []Message{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: task},
+		}
+	} else {
+		// Update system prompt to maintain current working directory info
+		if len(a.conversation) > 0 && a.conversation[0].Role == "system" {
+			a.conversation[0].Content = systemPrompt
+		}
+		a.conversation = append(a.conversation, Message{Role: "user", Content: task})
 	}
 	a.mu.Unlock()
 
@@ -105,102 +142,162 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 
 		// Check for completion signal
 		if strings.Contains(response, "DONE_TASK_COMPLETE") {
-			finalOutput.WriteString("\n=== Task Complete ===\n")
+			// Extract the final answer after DONE_TASK_COMPLETE
+			finalAnswer := strings.TrimSpace(strings.SplitN(response, "DONE_TASK_COMPLETE", 2)[1])
+			if finalAnswer != "" {
+				msg := fmt.Sprintf("\n\033[36m🤖 Assistant:\033[0m\n%s\n", finalAnswer)
+				fmt.Print(msg)
+				finalOutput.WriteString(msg)
+			}
+			msg := "\n✨ Task Complete ✨\n"
+			fmt.Print(msg)
+			finalOutput.WriteString(msg)
 			break
 		}
 
-		// Step 2: Action - Parse and execute tool call
-		toolCall, err := llm.ParseToolCall(response)
+		// Parse and execute tools
+		toolCalls, err := llm.ParseToolCalls(response)
 		if err != nil {
-			// If not a tool call, treat as direct response
+			// If no tools found, treat as direct conversational response and break the loop
 			a.mu.Lock()
 			a.conversation = append(a.conversation, Message{Role: "assistant", Content: response})
 			a.mu.Unlock()
 
-			finalOutput.WriteString(fmt.Sprintf("\n[Iteration %d] Response:\n%s\n", iteration, response))
-			continue
+			msg := fmt.Sprintf("\n\033[36m🤖 Assistant:\033[0m\n%s\n", response)
+			fmt.Print(msg)
+			finalOutput.WriteString(msg)
+			break
 		}
 
-		// Execute tool via goroutine with channel for non-blocking execution
-		resultChan := make(chan string, 1)
-		errorChan := make(chan error, 1)
+		// Append the assistant's unified response once before executing tools
+		a.mu.Lock()
+		a.conversation = append(a.conversation, Message{Role: "assistant", Content: response})
+		a.mu.Unlock()
 
-		go func() {
-			defer close(resultChan)
-			defer close(errorChan)
+		// Execute tools concurrently
+		var wg sync.WaitGroup
+		var toolMu sync.Mutex
 
-			tool, ok := a.registry.Get(toolCall.Tool)
-			if !ok {
-				errorChan <- fmt.Errorf("unknown tool: %s", toolCall.Tool)
-				return
-			}
+		for _, tc := range toolCalls {
+			wg.Add(1)
+			go func(toolCall llm.ToolCall) {
+				defer wg.Done()
 
-			result, err := tool.Execute(toolCall.Args)
-			if err != nil {
-				errorChan <- err
-				return
-			}
+				tool, ok := a.registry.Get(toolCall.Tool)
+				if !ok {
+					errMsg := fmt.Sprintf("unknown tool: %s", toolCall.Tool)
+					a.mu.Lock()
+					errorKey := fmt.Sprintf("%s:%v", toolCall.Tool, errMsg)
+					attempts := a.reflectionAttempts[errorKey]
 
-			resultChan <- result
-		}()
+					if attempts < 3 { // Retry loop logic
+						reflectionMsg := fmt.Sprintf("Tool '%s' failed: %s. Attempting correction...\n", toolCall.Tool, errMsg)
+						a.conversation = append(a.conversation, Message{Role: "system", Content: reflectionMsg})
+						a.reflectionAttempts[errorKey] = attempts + 1
+					}
+					a.mu.Unlock()
 
-		// Step 3: Observation - Wait for tool execution with timeout
-		select {
-		case <-ctx.Done():
-			return finalOutput.String(), ctx.Err()
-		case err := <-errorChan:
-			// Reflection Loop: Analyze error and attempt correction
-			a.mu.Lock()
-			errorKey := fmt.Sprintf("%s:%v", toolCall.Tool, err)
-			attempts := a.reflectionAttempts[errorKey]
-			a.mu.Unlock()
+					toolMu.Lock()
+					msg := fmt.Sprintf("\n⚠️ Tool '%s' failed: %v\n", toolCall.Tool, errMsg)
+					fmt.Print(msg)
+					finalOutput.WriteString(msg)
+					toolMu.Unlock()
+					return
+				}
 
-			if attempts < 3 { // Max 3 retry attempts per error pattern
-				// Add reflection message to conversation for learning
-				reflectionMsg := fmt.Sprintf("Tool '%s' failed with error: %v. Attempting correction...\n", toolCall.Tool, err)
+				// Execute tool
+				result, err := tool.Execute(ctx, toolCall.Args)
+
+				// Handle Error
+				if err != nil {
+					a.mu.Lock()
+					errorKey := fmt.Sprintf("%s:%v", toolCall.Tool, err)
+					attempts := a.reflectionAttempts[errorKey]
+
+					if attempts < 3 {
+						reflectionMsg := fmt.Sprintf("Tool '%s' failed with error: %v. Attempting correction...\n", toolCall.Tool, err)
+						a.conversation = append(a.conversation, Message{Role: "system", Content: reflectionMsg})
+						a.reflectionAttempts[errorKey] = attempts + 1
+					}
+					a.mu.Unlock()
+
+					toolMu.Lock()
+					msg := fmt.Sprintf("\n⚠️ Tool '%s' failed: %v (attempt %d/3)\n", toolCall.Tool, err, attempts+1)
+					fmt.Print(msg)
+					finalOutput.WriteString(msg)
+					toolMu.Unlock()
+					return
+				}
+
+				// Handle Success
+				toolMu.Lock()
+
+				// Generate dynamic context-aware message based on the tool executed
+				var dynamicMsg string
+				switch toolCall.Tool {
+				case "list_directory":
+					dynamicMsg = fmt.Sprintf("Listed directory: %v", toolCall.Args["path"])
+				case "read_file":
+					dynamicMsg = fmt.Sprintf("Read file: %v", toolCall.Args["path"])
+				case "search_file":
+					dynamicMsg = fmt.Sprintf("Searched for file: %v", toolCall.Args["name"])
+				case "grep_search":
+					dynamicMsg = fmt.Sprintf("Grep searched for \"%v\" in %v", toolCall.Args["query"], toolCall.Args["path"])
+				case "write_file":
+					dynamicMsg = fmt.Sprintf("Wrote to file: %v", toolCall.Args["path"])
+				case "replace_file_content":
+					dynamicMsg = fmt.Sprintf("Replaced content in file: %v", toolCall.Args["path"])
+				case "read_url":
+					dynamicMsg = fmt.Sprintf("Fetched URL: %v", toolCall.Args["url"])
+				case "run_command":
+					dynamicMsg = fmt.Sprintf("Ran command: %v", toolCall.Args["command"])
+				default:
+					dynamicMsg = fmt.Sprintf("Executed tool: %s", toolCall.Tool)
+				}
+
+				msg := fmt.Sprintf("\n✅ \033[32m%s\033[0m\n", dynamicMsg)
+				fmt.Print(msg)
+				finalOutput.WriteString(msg)
+				toolMu.Unlock()
 
 				a.mu.Lock()
-				a.conversation = append(a.conversation, Message{Role: "system", Content: reflectionMsg})
-				a.reflectionAttempts[errorKey] = attempts + 1
+				a.conversation = append(a.conversation,
+					Message{Role: "tool", Content: fmt.Sprintf("Tool '%s' executed successfully:\n%s", toolCall.Tool, result)},
+				)
+				a.reflectionAttempts = make(map[string]int) // Reset on success
 				a.mu.Unlock()
 
-				finalOutput.WriteString(fmt.Sprintf("\n[Iteration %d] Tool '%s' failed: %v (attempt %d/3)\n",
-					iteration, toolCall.Tool, err, attempts+1))
-
-				// Continue loop for retry
-				continue
-			}
-
-			return finalOutput.String(), fmt.Errorf("tool '%s' failed after 3 attempts: %w", toolCall.Tool, err)
-
-		case result := <-resultChan:
-			a.mu.Lock()
-			a.conversation = append(a.conversation,
-				Message{Role: "assistant", Content: response},
-				Message{Role: "tool", Content: fmt.Sprintf("Tool '%s' executed successfully:\n%s", toolCall.Tool, result)},
-			)
-			a.reflectionAttempts = make(map[string]int) // Reset on success
-			a.mu.Unlock()
-
-			finalOutput.WriteString(fmt.Sprintf("\n[Iteration %d] Tool '%s' output:\n%s\n",
-				iteration, toolCall.Tool, result))
+			}(tc)
 		}
+
+		wg.Wait()
+
+		// Let the loop continue to the next iteration so the LLM can analyze the tool results
+		continue
 	}
 
 	return finalOutput.String(), nil
 }
 
 // getLLMResponse sends the conversation to LLM and gets response.
-// Implements context window management by truncating old messages (memory optimization).
 func (a *Agent) getLLMResponse(ctx context.Context) (string, error) {
 	a.mu.RLock()
 	conversation := make([]Message, len(a.conversation))
 	copy(conversation, a.conversation)
 	a.mu.RUnlock()
 
-	// Context window management: keep only recent messages to reduce token usage
-	if len(conversation) > 10 { // Keep last ~10 exchanges
-		conversation = conversation[len(conversation)-10:]
+	// Context window management: Drop older messages if total length exceeds contextWindow limit
+	// Approximation: 1 token ≈ 4 characters
+	maxChars := a.contextWindow * 4
+	totalChars := 0
+	for _, msg := range conversation {
+		totalChars += len(msg.Content)
+	}
+	// Drop older messages until we are under the limit
+	for totalChars > maxChars && len(conversation) > 2 {
+		droppedMsg := conversation[1]
+		totalChars -= len(droppedMsg.Content)
+		conversation = append(conversation[:1], conversation[2:]...)
 	}
 
 	// Convert to LLM.Message format for API call
@@ -209,22 +306,12 @@ func (a *Agent) getLLMResponse(ctx context.Context) (string, error) {
 		llmMessages[i] = llm.Message{Role: msg.Role, Content: msg.Content}
 	}
 
-	response, err := a.llmClient.Chat(ctx, a.model, llmMessages, false) // Disable JSON mode for testing
+	response, err := a.llmClient.Chat(ctx, a.model, llmMessages, false)
 	if err != nil {
 		return "", fmt.Errorf("LLM chat failed: %w", err)
 	}
 
-	a.mu.Lock()
-	a.conversation = append(a.conversation, Message{Role: "assistant", Content: response.Response})
-	a.mu.Unlock()
-
-	fmt.Fprintf(os.Stderr, "[DEBUG] LLM Response length: %d chars\n", len(response.Response))
-	if len(response.Response) == 0 {
-		fmt.Fprintf(os.Stderr, "[DEBUG] Empty response - checking conversation:\n")
-		for i, msg := range llmMessages {
-			fmt.Fprintf(os.Stderr, "  [%d] %s: %.50s...\n", i, msg.Role, msg.Content)
-		}
-	}
+	// NOTE: Do NOT append assistant message here - the caller (Execute) handles conversation state
 	return response.Response, nil
 }
 
@@ -243,4 +330,36 @@ func (a *Agent) Reset() {
 	a.conversation = nil
 	a.reflectionAttempts = make(map[string]int)
 	a.mu.Unlock()
+}
+
+// GetLLMClient returns the underlying LLM client.
+func (a *Agent) GetLLMClient() *llm.Client {
+	return a.llmClient
+}
+
+// SaveHistory saves the current conversation to a JSON file.
+func (a *Agent) SaveHistory(filepath string) error {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	data, err := json.MarshalIndent(a.conversation, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath, data, 0644)
+}
+
+// LoadHistory loads the conversation from a JSON file.
+func (a *Agent) LoadHistory(filepath string) error {
+	data, err := os.ReadFile(filepath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // OK if file doesn't exist yet
+		}
+		return err
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return json.Unmarshal(data, &a.conversation)
 }

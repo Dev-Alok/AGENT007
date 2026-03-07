@@ -2,12 +2,16 @@ package tools
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Tool represents a callable tool with name and execution function.
@@ -15,7 +19,7 @@ import (
 type Tool struct {
 	Name        string
 	Description string
-	Execute     func(args map[string]interface{}) (string, error)
+	Execute     func(ctx context.Context, args map[string]interface{}) (string, error)
 }
 
 // Registry maintains a thread-safe map of available tools.
@@ -65,8 +69,8 @@ func (r *Registry) List() []string {
 func ReadFileTool() Tool {
 	return Tool{
 		Name:        "read_file",
-		Description: "Read the contents of a file at the specified path.",
-		Execute: func(args map[string]interface{}) (string, error) {
+		Description: "Read the contents of a file at the specified path. Requires argument: 'path' (string).",
+		Execute: func(ctx context.Context, args map[string]interface{}) (string, error) {
 			path, ok := args["path"].(string)
 			if !ok || path == "" {
 				return "", fmt.Errorf("missing or invalid 'path' argument")
@@ -83,12 +87,11 @@ func ReadFileTool() Tool {
 }
 
 // WriteFileTool returns a tool that writes content to a file.
-// Creates parent directories if they don't exist (user convenience).
 func WriteFileTool() Tool {
 	return Tool{
 		Name:        "write_file",
-		Description: "Write content to a file at the specified path.",
-		Execute: func(args map[string]interface{}) (string, error) {
+		Description: "Write content to a file. Requires arguments: 'path' (string) and 'content' (string).",
+		Execute: func(ctx context.Context, args map[string]interface{}) (string, error) {
 			path, ok := args["path"].(string)
 			if !ok || path == "" {
 				return "", fmt.Errorf("missing or invalid 'path' argument")
@@ -99,7 +102,7 @@ func WriteFileTool() Tool {
 				return "", fmt.Errorf("missing or invalid 'content' argument")
 			}
 
-			// Create parent directories if needed (Go's explicit error handling)
+			// Create parent directories if needed
 			dir := filepath.Dir(path)
 			if err := os.MkdirAll(dir, 0755); err != nil {
 				return "", fmt.Errorf("failed to create directory: %w", err)
@@ -115,25 +118,32 @@ func WriteFileTool() Tool {
 }
 
 // RunCommandTool returns a tool that executes shell commands.
-// Uses exec.Command with timeout for safety (prevents hanging).
 func RunCommandTool() Tool {
 	return Tool{
 		Name:        "run_command",
-		Description: "Execute a shell command and return its output.",
-		Execute: func(args map[string]interface{}) (string, error) {
+		Description: "Execute a shell command and return its output. Requires argument: 'command' (string).",
+		Execute: func(ctx context.Context, args map[string]interface{}) (string, error) {
 			cmdStr, ok := args["command"].(string)
 			if !ok || cmdStr == "" {
 				return "", fmt.Errorf("missing or invalid 'command' argument")
 			}
 
 			// Split command into parts for exec.Command
-			// Note: Using shell=False for security; caller should escape properly
 			parts := strings.Split(cmdStr, " ")
 			if len(parts) == 0 {
 				return "", fmt.Errorf("empty command")
 			}
 
-			cmd := exec.Command(parts[0], parts[1:]...)
+			// Security sandbox: block dangerous base commands
+			blacklist := []string{"rm", "del", "format", "mkfs", "sudo", "su", "shutdown", "reboot"}
+			baseCmd := strings.ToLower(parts[0])
+			for _, blocked := range blacklist {
+				if baseCmd == blocked {
+					return "", fmt.Errorf("security violation: execution of command '%s' is not allowed in sandbox", baseCmd)
+				}
+			}
+
+			cmd := exec.CommandContext(ctx, parts[0], parts[1:]...)
 
 			var stdout, stderr bytes.Buffer
 			cmd.Stdout = &stdout
@@ -152,15 +162,14 @@ func RunCommandTool() Tool {
 }
 
 // ListDirectoryTool returns a tool that lists directory contents.
-// Returns formatted list with file types and permissions.
 func ListDirectoryTool() Tool {
 	return Tool{
 		Name:        "list_directory",
-		Description: "List files and directories at the specified path.",
-		Execute: func(args map[string]interface{}) (string, error) {
+		Description: "List files and directories at the specified path. Requires argument: 'path' (string).",
+		Execute: func(ctx context.Context, args map[string]interface{}) (string, error) {
 			path, ok := args["path"].(string)
 			if !ok || path == "" {
-				return "", fmt.Errorf("missing or invalid 'path' argument")
+				path = "." // Default to current directory if not specified
 			}
 
 			entries, err := os.ReadDir(path)
@@ -191,6 +200,186 @@ func ListDirectoryTool() Tool {
 			}
 
 			return result.String(), nil
+		},
+	}
+}
+
+// SearchFileTool returns a tool that searches for a file by name.
+func SearchFileTool() Tool {
+	return Tool{
+		Name:        "search_file",
+		Description: "Search for a file by exact name in the workspace. Requires argument: 'name' (string).",
+		Execute: func(ctx context.Context, args map[string]interface{}) (string, error) {
+			filename, ok := args["name"].(string)
+			if !ok || filename == "" {
+				return "", fmt.Errorf("missing or invalid 'name' argument")
+			}
+
+			var matches []string
+			err := filepath.WalkDir(".", func(path string, d os.DirEntry, err error) error {
+				if err != nil {
+					return nil // Skip paths we can't access
+				}
+				if d.IsDir() && d.Name() == ".git" {
+					return filepath.SkipDir
+				}
+				if !d.IsDir() && d.Name() == filename {
+					matches = append(matches, path)
+				}
+				return nil
+			})
+
+			if err != nil {
+				return "", fmt.Errorf("search failed: %w", err)
+			}
+
+			if len(matches) == 0 {
+				return "", fmt.Errorf("file '%s' not found in workspace", filename)
+			}
+
+			return "Found at:\n" + strings.Join(matches, "\n"), nil
+		},
+	}
+}
+
+// GrepSearchTool returns a tool that searches for a regex pattern in files.
+func GrepSearchTool() Tool {
+	return Tool{
+		Name:        "grep_search",
+		Description: "Search for a regex pattern in files. Requires arguments: 'path' (directory to search) and 'query' (regex string).",
+		Execute: func(ctx context.Context, args map[string]interface{}) (string, error) {
+			path, okPath := args["path"].(string)
+			if !okPath || path == "" {
+				path = "."
+			}
+			query, okQuery := args["query"].(string)
+			if !okQuery || query == "" {
+				return "", fmt.Errorf("missing or invalid 'query' argument")
+			}
+
+			var result strings.Builder
+			count := 0
+			err := filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
+				if err != nil {
+					return nil
+				}
+				if d.IsDir() {
+					if d.Name() == ".git" || d.Name() == "node_modules" {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+
+				// Read files text to search
+				data, err := os.ReadFile(p)
+				if err != nil {
+					return nil
+				}
+
+				content := string(data)
+				if strings.Contains(content, query) {
+					lines := strings.Split(content, "\n")
+					for i, line := range lines {
+						if strings.Contains(line, query) {
+							fmt.Fprintf(&result, "%s:%d: %s\n", p, i+1, strings.TrimSpace(line))
+							count++
+							if count >= 100 { // Max results limit
+								fmt.Fprintf(&result, "... additional results truncated ...\n")
+								return fmt.Errorf("limit reached")
+							}
+						}
+					}
+				}
+				return nil
+			})
+
+			if err != nil && err.Error() != "limit reached" {
+				return "", fmt.Errorf("search failed: %w", err)
+			}
+
+			if count == 0 {
+				return "No matches found.", nil
+			}
+			return result.String(), nil
+		},
+	}
+}
+
+// ReplaceFileContentTool allows targeted file replacement.
+func ReplaceFileContentTool() Tool {
+	return Tool{
+		Name:        "replace_file_content",
+		Description: "Replaces target string with replacement string in a file. Requires arguments: 'path', 'target', and 'replacement'.",
+		Execute: func(ctx context.Context, args map[string]interface{}) (string, error) {
+			path, okPath := args["path"].(string)
+			target, okTarget := args["target"].(string)
+			replacement, okReplacement := args["replacement"].(string)
+
+			if !okPath || path == "" || !okTarget || !okReplacement {
+				return "", fmt.Errorf("missing required 'path', 'target', or 'replacement' argument")
+			}
+
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return "", fmt.Errorf("failed to read file: %w", err)
+			}
+
+			content := string(data)
+			if !strings.Contains(content, target) {
+				return "", fmt.Errorf("target string not found in file")
+			}
+
+			newContent := strings.Replace(content, target, replacement, 1) // strictly replace first occurence or change to ReplaceAll if needed
+
+			if err := os.WriteFile(path, []byte(newContent), 0644); err != nil {
+				return "", fmt.Errorf("failed to write file: %w", err)
+			}
+
+			return fmt.Sprintf("Successfully replaced content in %s", path), nil
+		},
+	}
+}
+
+// ReadURLTool reads contents from a web page.
+func ReadURLTool() Tool {
+	return Tool{
+		Name:        "read_url",
+		Description: "Fetch content from a web URL. Requires argument: 'url' (string).",
+		Execute: func(ctx context.Context, args map[string]interface{}) (string, error) {
+			url, ok := args["url"].(string)
+			if !ok || url == "" {
+				return "", fmt.Errorf("missing or invalid 'url' argument")
+			}
+
+			req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+			if err != nil {
+				return "", fmt.Errorf("invalid request: %w", err)
+			}
+
+			// Simple HTTP client setup
+			client := &http.Client{Timeout: 10 * time.Second}
+			resp, err := client.Do(req)
+			if err != nil {
+				return "", fmt.Errorf("failed to fetch URL: %w", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				return "", fmt.Errorf("HTTP error %d: %s", resp.StatusCode, resp.Status)
+			}
+
+			bodyBytes, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return "", fmt.Errorf("failed to read response: %w", err)
+			}
+
+			// Optional: In a full system you might run HTML to Markdown parsing here
+			// For now, return basic text (trimmed to avoid excessive context usage)
+			bodyStr := string(bodyBytes)
+			if len(bodyStr) > 4000 {
+				bodyStr = bodyStr[:4000] + "\n... (content truncated)"
+			}
+			return bodyStr, nil
 		},
 	}
 }
