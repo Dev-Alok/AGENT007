@@ -1,0 +1,16 @@
+# Agentic Coder ignored files
+
+# Local configuration
+config.json
+
+# Internal agent state and logs
+.agent_history.json
+agent.log
+
+# Build output
+*.exe
+agentic-coder
+
+# OS generated files
+.DS_Store
+Thumbs.db

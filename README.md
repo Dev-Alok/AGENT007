@@ -7,8 +7,18 @@ This project binds an interactive Terminal CLI to an AI model (like Ollama or Op
 
 For detailed design, implementation details, and architecture mapping, please see the [Wiki Documentation](./wiki/Architecture.md).
 
+## Configuration
+Before running the agent, you must configure your local LLM settings.
+
+1. Copy the example configuration file:
+   ```bash
+   cp example-config.json config.json
+   ```
+2. Open `config.json` and update your `"llm_endpoint"`, `"model"`, and other parameters. 
+*(Note: `config.json` is ignored by git to protect your API keys.)*
+
 ## Usage
-Ensure you have a local LLM running (e.g. LM Studio on port `1234`), then run the agent interface:
+Ensure you have a local LLM running (e.g. LM Studio on port `1234`), then open a terminal and run the agent interface:
 ```bash
 go run main.go
 ```

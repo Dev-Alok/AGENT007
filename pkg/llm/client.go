@@ -510,10 +510,12 @@ func extractJSONBlocks(text string) []string {
 			}
 			depth++
 		case '}':
-			depth--
-			if depth == 0 && start >= 0 {
-				blocks = append(blocks, text[start:i+1])
-				start = -1
+			if depth > 0 {
+				depth--
+				if depth == 0 && start >= 0 {
+					blocks = append(blocks, text[start:i+1])
+					start = -1
+				}
 			}
 		}
 	}
