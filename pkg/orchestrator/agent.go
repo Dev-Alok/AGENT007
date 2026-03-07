@@ -158,9 +158,28 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 		// Parse and execute tools
 		toolCalls, err := llm.ParseToolCalls(response)
 		if err != nil {
-			// If no tools found, treat as direct conversational response and break the loop
+			// Track parsing errors specifically to give the LLM a chance to correct hallucinatory output
 			a.mu.Lock()
+			errorKey := "system:parsing_error"
+			attempts := a.reflectionAttempts[errorKey]
+
+			if attempts < 3 {
+				// Retry loop for bad tool formatting
+				reflectionMsg := fmt.Sprintf("Error: Your response was not a valid JSON tool call. %v. REMEMBER: You must respond with ONLY a single valid JSON object representing a tool call, and nothing else.", err)
+				a.conversation = append(a.conversation, Message{Role: "assistant", Content: response})
+				a.conversation = append(a.conversation, Message{Role: "system", Content: reflectionMsg})
+				a.reflectionAttempts[errorKey] = attempts + 1
+				a.mu.Unlock()
+
+				msg := fmt.Sprintf("\n⚠️ LLM Format Error: %v. Retrying (attempt %d/3)...\n", err, attempts+1)
+				fmt.Print(msg)
+				finalOutput.WriteString(msg)
+				continue // Let the LLM try again in the next iteration
+			}
+
+			// If max retries reached, treat as direct conversational response and break
 			a.conversation = append(a.conversation, Message{Role: "assistant", Content: response})
+			a.reflectionAttempts = make(map[string]int) // Reset on exit
 			a.mu.Unlock()
 
 			msg := fmt.Sprintf("\n\033[36m🤖 Assistant:\033[0m\n%s\n", response)
@@ -191,7 +210,7 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 					attempts := a.reflectionAttempts[errorKey]
 
 					if attempts < 3 { // Retry loop logic
-						reflectionMsg := fmt.Sprintf("Tool '%s' failed: %s. Attempting correction...\n", toolCall.Tool, errMsg)
+						reflectionMsg := fmt.Sprintf("Tool '%s' failed: %s. Attempting correction. REMEMBER: You must respond with ONLY a single valid JSON object. Do not output anything else.", toolCall.Tool, errMsg)
 						a.conversation = append(a.conversation, Message{Role: "system", Content: reflectionMsg})
 						a.reflectionAttempts[errorKey] = attempts + 1
 					}
@@ -215,7 +234,7 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 					attempts := a.reflectionAttempts[errorKey]
 
 					if attempts < 3 {
-						reflectionMsg := fmt.Sprintf("Tool '%s' failed with error: %v. Attempting correction...\n", toolCall.Tool, err)
+						reflectionMsg := fmt.Sprintf("Tool '%s' failed with error: %v. Attempting correction. REMEMBER: You must respond with ONLY a single valid JSON object. Do not output anything else.", toolCall.Tool, err)
 						a.conversation = append(a.conversation, Message{Role: "system", Content: reflectionMsg})
 						a.reflectionAttempts[errorKey] = attempts + 1
 					}

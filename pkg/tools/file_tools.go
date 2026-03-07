@@ -76,6 +76,17 @@ func ReadFileTool() Tool {
 				return "", fmt.Errorf("missing or invalid 'path' argument")
 			}
 
+			fileInfo, err := os.Stat(path)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return "", fmt.Errorf("failed to read file: %w. Tip: The file does not exist. Use 'list_directory' or 'search_file' to find the correct path before trying again", err)
+				}
+				return "", fmt.Errorf("failed to access file info: %w", err)
+			}
+			if fileInfo.IsDir() {
+				return "", fmt.Errorf("failed to read file: '%s' is a directory, not a file. Use 'list_directory' to view its contents", path)
+			}
+
 			data, err := os.ReadFile(path)
 			if err != nil {
 				return "", fmt.Errorf("failed to read file: %w", err)
