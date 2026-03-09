@@ -1,9 +1,0 @@
-{
-    "llm_endpoint": "http://192.168.1.10:1234",
-    "model": "llama-3-8b-instruct",
-    "context_window": 100000,
-    "use_openai": true,
-    "lmstudio_port": 1234,
-    "lmstudio_api_key": "",
-    "llm_timeout_seconds": 300
-}

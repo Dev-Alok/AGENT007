@@ -36,10 +36,10 @@ type Message struct {
 
 // NewAgent creates a new agent with the specified tool registry, LLM endpoint, and model.
 // contextWindow limits token usage to prevent runaway costs (performance optimization).
-func NewAgent(registry *tools.Registry, contextWindow int, llmEndpoint, apiKey, model string) *Agent {
+func NewAgent(registry *tools.Registry, contextWindow int, llmEndpoint, apiKey, model string, temperature float32, numPredict, topK int, topP, repeatPenalty float32, seed int) *Agent {
 	return &Agent{
 		registry:           registry,
-		llmClient:          llm.NewClient(llmEndpoint, apiKey), // Supports both Ollama and LM Studio
+		llmClient:          llm.NewClient(llmEndpoint, apiKey, temperature, numPredict, topK, topP, repeatPenalty, seed), // Supports Ollama
 		model:              model,
 		contextWindow:      contextWindow,
 		maxIterations:      5, // Prevent infinite loops
@@ -48,42 +48,13 @@ func NewAgent(registry *tools.Registry, contextWindow int, llmEndpoint, apiKey, 
 }
 
 // NewAgentWithTimeout creates a new agent with custom timeout.
-func NewAgentWithTimeout(registry *tools.Registry, contextWindow int, llmEndpoint, apiKey, model string, timeout time.Duration) *Agent {
+func NewAgentWithTimeout(registry *tools.Registry, contextWindow int, llmEndpoint, apiKey, model string, temperature float32, numPredict, topK int, topP, repeatPenalty float32, seed int, timeout time.Duration) *Agent {
 	return &Agent{
 		registry:           registry,
-		llmClient:          llm.NewClientWithTimeout(llmEndpoint, apiKey, timeout),
+		llmClient:          llm.NewClientWithTimeout(llmEndpoint, apiKey, temperature, numPredict, topK, topP, repeatPenalty, seed, timeout),
 		model:              model,
 		contextWindow:      contextWindow,
 		maxIterations:      5, // Prevent infinite loops
-		reflectionAttempts: make(map[string]int),
-	}
-}
-
-// NewAgentWithAPIType creates a new agent with explicit API type selection.
-// Use this when you need to specify OpenAI-compatible format (LM Studio) vs Ollama.
-func NewAgentWithAPIType(registry *tools.Registry, contextWindow int, llmEndpoint, apiKey, model string, apiType llm.APIType) *Agent {
-	client := llm.NewClientWithAPIType(llmEndpoint, apiKey, apiType)
-
-	return &Agent{
-		registry:           registry,
-		llmClient:          client,
-		model:              model,
-		contextWindow:      contextWindow,
-		maxIterations:      50, // Prevent infinite loops
-		reflectionAttempts: make(map[string]int),
-	}
-}
-
-// NewAgentWithTimeoutAndAPIType creates a new agent with custom timeout and API type.
-func NewAgentWithTimeoutAndAPIType(registry *tools.Registry, contextWindow int, llmEndpoint, apiKey, model string, apiType llm.APIType, timeout time.Duration) *Agent {
-	client := llm.NewClientWithTimeoutAndAPIType(llmEndpoint, apiKey, apiType, timeout)
-
-	return &Agent{
-		registry:           registry,
-		llmClient:          client,
-		model:              model,
-		contextWindow:      contextWindow,
-		maxIterations:      50, // Prevent infinite loops
 		reflectionAttempts: make(map[string]int),
 	}
 }
@@ -134,17 +105,16 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 
 		iteration = i + 1
 
-		// Step 1: Thought - Get LLM response
-		response, err := a.getLLMResponse(ctx)
+		// Step 1: Thought - Get LLM response via streaming
+		response, err := a.getLLMResponseStream(ctx, &finalOutput)
 		if err != nil {
 			return finalOutput.String(), fmt.Errorf("LLM error at iteration %d: %w", iteration, err)
 		}
 
-		// Check for completion signal
 		if strings.Contains(response, "DONE_TASK_COMPLETE") {
-			// Extract the final answer after DONE_TASK_COMPLETE
+			// Determine final answer part after DONE_TASK_COMPLETE and check if it already printed
 			finalAnswer := strings.TrimSpace(strings.SplitN(response, "DONE_TASK_COMPLETE", 2)[1])
-			if finalAnswer != "" {
+			if finalAnswer != "" && !strings.Contains(finalOutput.String(), finalAnswer) {
 				msg := fmt.Sprintf("\n\033[36m🤖 Assistant:\033[0m\n%s\n", finalAnswer)
 				fmt.Print(msg)
 				finalOutput.WriteString(msg)
@@ -182,9 +152,12 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 			a.reflectionAttempts = make(map[string]int) // Reset on exit
 			a.mu.Unlock()
 
-			msg := fmt.Sprintf("\n\033[36m🤖 Assistant:\033[0m\n%s\n", response)
-			fmt.Print(msg)
-			finalOutput.WriteString(msg)
+			// Check if we need to print it (might already be printed by stream)
+			if !strings.Contains(finalOutput.String(), response) {
+				msg := fmt.Sprintf("\n\033[36m🤖 Assistant:\033[0m\n%s\n", response)
+				fmt.Print(msg)
+				finalOutput.WriteString(msg)
+			}
 			break
 		}
 
@@ -298,40 +271,67 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 	return finalOutput.String(), nil
 }
 
-// getLLMResponse sends the conversation to LLM and gets response.
-func (a *Agent) getLLMResponse(ctx context.Context) (string, error) {
+// getLLMResponseStream sends the conversation to LLM and processes the streamed response.
+func (a *Agent) getLLMResponseStream(ctx context.Context, finalOutput *strings.Builder) (string, error) {
 	a.mu.RLock()
 	conversation := make([]Message, len(a.conversation))
 	copy(conversation, a.conversation)
 	a.mu.RUnlock()
 
-	// Context window management: Drop older messages if total length exceeds contextWindow limit
-	// Approximation: 1 token ≈ 4 characters
+	// Context window management
 	maxChars := a.contextWindow * 4
 	totalChars := 0
 	for _, msg := range conversation {
 		totalChars += len(msg.Content)
 	}
-	// Drop older messages until we are under the limit
 	for totalChars > maxChars && len(conversation) > 2 {
 		droppedMsg := conversation[1]
 		totalChars -= len(droppedMsg.Content)
 		conversation = append(conversation[:1], conversation[2:]...)
 	}
 
-	// Convert to LLM.Message format for API call
 	llmMessages := make([]llm.Message, len(conversation))
 	for i, msg := range conversation {
 		llmMessages[i] = llm.Message{Role: msg.Role, Content: msg.Content}
 	}
 
-	response, err := a.llmClient.Chat(ctx, a.model, llmMessages, false)
-	if err != nil {
-		return "", fmt.Errorf("LLM chat failed: %w", err)
-	}
+	resultChan := make(chan *llm.ChatResponse, 100) // Buffer stream
+	errChan := make(chan error, 1)
 
-	// NOTE: Do NOT append assistant message here - the caller (Execute) handles conversation state
-	return response.Response, nil
+	go a.llmClient.StreamChat(ctx, a.model, llmMessages, false, resultChan, errChan)
+
+	var fullResponse strings.Builder
+	formattedThinking := false
+
+	for {
+		select {
+		case err := <-errChan:
+			if err != nil {
+				return "", fmt.Errorf("LLM stream failed: %w", err)
+			}
+			return fullResponse.String(), nil
+		case resp, ok := <-resultChan:
+			if !ok {
+				// Channel closed, streaming complete
+				return fullResponse.String(), nil
+			}
+
+			// We print just the new chunks to standard output for real time feel
+			if !formattedThinking {
+				fmt.Print("\n\033[36m🤖 Assistant:\033[0m\n")
+				finalOutput.WriteString(fmt.Sprintf("\n\033[36m🤖 Assistant:\033[0m\n"))
+				formattedThinking = true
+			}
+
+			// Calculate the diff to print only newly generated characters
+			newContent := strings.TrimPrefix(resp.Response, fullResponse.String())
+			fmt.Print(newContent)
+			finalOutput.WriteString(newContent)
+			fullResponse.WriteString(newContent)
+		case <-ctx.Done():
+			return fullResponse.String(), ctx.Err()
+		}
+	}
 }
 
 // GetConversation returns a copy of the current conversation history.

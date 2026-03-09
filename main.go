@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"agentic-coder/pkg/config"
-	"agentic-coder/pkg/llm"
 	"agentic-coder/pkg/orchestrator"
 	"agentic-coder/pkg/tools"
 )
@@ -40,9 +39,12 @@ func main() {
 	llmEndpoint := cfg.LLMEndpoint
 	model := cfg.Model
 	contextWindow := cfg.ContextWindow
-	useOpenAI := cfg.UseOpenAI
-	lmStudioPort := cfg.LMStudioPort
-	lmStudioAPIKey := cfg.LMStudioAPIKey
+	temperature := cfg.Temperature
+	numPredict := cfg.NumPredict
+	topK := cfg.TopK
+	topP := cfg.TopP
+	repeatPenalty := cfg.RepeatPenalty
+	seed := cfg.Seed
 	llmTimeout := cfg.LLMTimeoutSeconds
 
 	// Initialize signal handling for graceful shutdown
@@ -64,22 +66,9 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Adjust endpoint if LM Studio is used and endpoint is default
-	if useOpenAI && llmEndpoint == "http://localhost:11434" {
-		llmEndpoint = fmt.Sprintf("http://localhost:%d", lmStudioPort)
-	}
+	apiKey := "" // Ollama doesn't typically require an API key by default
 
-	apiKey := ""
-	if useOpenAI && lmStudioAPIKey != "" {
-		apiKey = lmStudioAPIKey
-	}
-
-	var agent *orchestrator.Agent
-	if useOpenAI {
-		agent = orchestrator.NewAgentWithTimeoutAndAPIType(registry, contextWindow, llmEndpoint, apiKey, model, llm.APIOpenAI, time.Duration(llmTimeout)*time.Second)
-	} else {
-		agent = orchestrator.NewAgentWithTimeout(registry, contextWindow, llmEndpoint, apiKey, model, time.Duration(llmTimeout)*time.Second)
-	}
+	agent := orchestrator.NewAgentWithTimeout(registry, contextWindow, llmEndpoint, apiKey, model, temperature, numPredict, topK, topP, repeatPenalty, seed, time.Duration(llmTimeout)*time.Second)
 
 	// Try to load state context
 	if err := agent.LoadHistory(".agent_history.json"); err != nil {
@@ -87,13 +76,11 @@ func main() {
 	}
 
 	// Validate connection
-	if useOpenAI {
-		if err := agent.GetLLMClient().HealthCheck(context.Background()); err != nil {
-			fmt.Printf("Warning: Could not connect to LM Studio: %v\n", err)
-			fmt.Println("Attempting to continue anyway...")
-		} else {
-			fmt.Println("Connection validated successfully.")
-		}
+	if err := agent.GetLLMClient().HealthCheck(context.Background()); err != nil {
+		fmt.Printf("Warning: Could not connect to LLM server at %s: %v\n", llmEndpoint, err)
+		fmt.Println("Attempting to continue anyway...")
+	} else {
+		fmt.Println("Connection to LLM server validated successfully.")
 	}
 
 	fmt.Println("\n=======================================================")
@@ -118,8 +105,6 @@ func main() {
 				fmt.Print("\n\033[32m👤 You: \033[0m")
 				continue
 			}
-
-			fmt.Println("\n\033[36m🤖 Thinking...\033[0m")
 
 			// Create new context for each task with timeout
 			taskCtx, taskCancel := context.WithTimeout(ctx, 5*time.Minute)

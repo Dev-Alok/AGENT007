@@ -9,13 +9,16 @@ import (
 // AgentConfig represents the configuration layout for the agent application.
 // Used instead of CLI flags to support easy profile switching.
 type AgentConfig struct {
-	LLMEndpoint       string `json:"llm_endpoint"`
-	Model             string `json:"model"`
-	ContextWindow     int    `json:"context_window"`
-	UseOpenAI         bool   `json:"use_openai"`
-	LMStudioPort      int    `json:"lmstudio_port"`
-	LMStudioAPIKey    string `json:"lmstudio_api_key"`
-	LLMTimeoutSeconds int    `json:"llm_timeout_seconds"`
+	LLMEndpoint       string  `json:"llm_endpoint"`
+	Model             string  `json:"model"`
+	ContextWindow     int     `json:"context_window"`
+	Temperature       float32 `json:"temperature"`
+	NumPredict        int     `json:"num_predict"`
+	TopK              int     `json:"top_k"`
+	TopP              float32 `json:"top_p"`
+	RepeatPenalty     float32 `json:"repeat_penalty"`
+	Seed              int     `json:"seed"`
+	LLMTimeoutSeconds int     `json:"llm_timeout_seconds"`
 }
 
 // LoadConfig parses a config.json file and returns an initialized AgentConfig.
@@ -26,9 +29,12 @@ func LoadConfig(filePath string) (*AgentConfig, error) {
 		LLMEndpoint:       "http://localhost:11434",
 		Model:             "llama2",
 		ContextWindow:     5000,
-		UseOpenAI:         false,
-		LMStudioPort:      1234,
-		LMStudioAPIKey:    "",
+		Temperature:       0.7,
+		NumPredict:        1000,
+		TopK:              40,
+		TopP:              0.9,
+		RepeatPenalty:     1.1,
+		Seed:              0,
 		LLMTimeoutSeconds: 30,
 	}
 

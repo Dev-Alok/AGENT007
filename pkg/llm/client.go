@@ -12,43 +12,27 @@ import (
 	"time"
 )
 
-// Client handles HTTP communication with Ollama or OpenAI-compatible APIs (LM Studio).
+// Client handles HTTP communication with Ollama.
 type Client struct {
-	baseURL    string
-	apiKey     string
-	httpClient *http.Client
-	mu         sync.RWMutex // Protects client state during reconnection
-	apiType    APIType      // Ollama or OpenAI format
+	baseURL       string
+	apiKey        string
+	temperature   float32
+	numPredict    int
+	topK          int
+	topP          float32
+	repeatPenalty float32
+	seed          int
+	httpClient    *http.Client
+	mu            sync.RWMutex // Protects client state during reconnection
 }
-
-// APIType specifies which API format to use.
-type APIType int
-
-const (
-	APIOllama APIType = iota
-	APIOpenAI         // LM Studio uses OpenAI-compatible format
-)
 
 // ChatRequest represents the request format for Ollama chat endpoint.
 type ChatRequest struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-	Stream   bool      `json:"stream"`
-	Format   *Format   `json:"format,omitempty"` // For structured output
-}
-
-// OpenAIChatRequest represents the request format for OpenAI-compatible APIs.
-type OpenAIChatRequest struct {
-	Model          string          `json:"model"`
-	Messages       []OpenAIMessage `json:"messages"`
-	Stream         bool            `json:"stream"`
-	ResponseFormat *ResponseFormat `json:"response_format,omitempty"` // For JSON mode
-}
-
-// OpenAIMessage represents a chat message in OpenAI format.
-type OpenAIMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Model    string                 `json:"model"`
+	Messages []Message              `json:"messages"`
+	Stream   bool                   `json:"stream"`
+	Format   *Format                `json:"format,omitempty"`  // For structured output
+	Options  map[string]interface{} `json:"options,omitempty"` // Model options like temperature
 }
 
 // Message represents a chat message in Ollama format.
@@ -62,11 +46,6 @@ type Format struct {
 	Type string `json:"type"` // "json"
 }
 
-// ResponseFormat specifies JSON response format - OpenAI/LM Studio format.
-type ResponseFormat struct {
-	Type string `json:"type"` // "json_schema"
-}
-
 // ChatResponse represents the response from Ollama.
 type ChatResponse struct {
 	Model     string    `json:"model"`
@@ -76,32 +55,10 @@ type ChatResponse struct {
 	Usage     Usage     `json:"usage,omitempty"`
 }
 
-// OpenAIChatResponse represents the response from OpenAI-compatible APIs.
-type OpenAIChatResponse struct {
-	Model   string      `json:"model"`
-	Created int64       `json:"created"`
-	Choices []Choice    `json:"choices"`
-	Usage   OpenAIUsage `json:"usage,omitempty"`
-}
-
-// Choice represents a choice in the response.
-type Choice struct {
-	Index        int           `json:"index"`
-	Message      OpenAIMessage `json:"message"`
-	FinishReason string        `json:"finish_reason"`
-}
-
 // Usage contains token usage statistics - Ollama format.
 type Usage struct {
 	PromptTokens   int `json:"prompt_tokens"`
 	ResponseTokens int `json:"response_tokens"`
-	TotalTokens    int `json:"total_tokens"`
-}
-
-// OpenAIUsage contains token usage statistics - OpenAI format.
-type OpenAIUsage struct {
-	PromptTokens   int `json:"prompt_tokens"`
-	ResponseTokens int `json:"completion_tokens"`
 	TotalTokens    int `json:"total_tokens"`
 }
 
@@ -113,58 +70,37 @@ type ToolCall struct {
 }
 
 // NewClient creates a new client for Ollama API.
-func NewClient(baseURL, apiKey string) *Client {
+func NewClient(baseURL, apiKey string, temperature float32, numPredict, topK int, topP, repeatPenalty float32, seed int) *Client {
 	return &Client{
-		baseURL: baseURL,
-		apiKey:  apiKey,
-		apiType: APIOllama,
+		baseURL:       baseURL,
+		apiKey:        apiKey,
+		temperature:   temperature,
+		numPredict:    numPredict,
+		topK:          topK,
+		topP:          topP,
+		repeatPenalty: repeatPenalty,
+		seed:          seed,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second, // Prevent indefinite hangs
 		},
 	}
 }
 
-// NewClientWithAPIType creates a new client with specified API type.
-func NewClientWithAPIType(baseURL, apiKey string, apiType APIType) *Client {
-	return &Client{
-		baseURL: baseURL,
-		apiKey:  apiKey,
-		apiType: apiType,
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
-	}
-}
-
 // NewClientWithTimeout creates a new client with custom timeout.
-func NewClientWithTimeout(baseURL, apiKey string, timeout time.Duration) *Client {
+func NewClientWithTimeout(baseURL, apiKey string, temperature float32, numPredict, topK int, topP, repeatPenalty float32, seed int, timeout time.Duration) *Client {
 	return &Client{
-		baseURL: baseURL,
-		apiKey:  apiKey,
-		apiType: APIOllama,
+		baseURL:       baseURL,
+		apiKey:        apiKey,
+		temperature:   temperature,
+		numPredict:    numPredict,
+		topK:          topK,
+		topP:          topP,
+		repeatPenalty: repeatPenalty,
+		seed:          seed,
 		httpClient: &http.Client{
 			Timeout: timeout,
 		},
 	}
-}
-
-// NewClientWithTimeoutAndAPIType creates a new client with custom timeout and API type.
-func NewClientWithTimeoutAndAPIType(baseURL, apiKey string, apiType APIType, timeout time.Duration) *Client {
-	return &Client{
-		baseURL: baseURL,
-		apiKey:  apiKey,
-		apiType: apiType,
-		httpClient: &http.Client{
-			Timeout: timeout,
-		},
-	}
-}
-
-// SetAPIType allows changing the API type at runtime.
-func (c *Client) SetAPIType(apiType APIType) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.apiType = apiType
 }
 
 // HealthCheck verifies that the LLM server is running and accessible.
@@ -172,16 +108,10 @@ func (c *Client) SetAPIType(apiType APIType) {
 func (c *Client) HealthCheck(ctx context.Context) error {
 	c.mu.RLock()
 	client := c.httpClient
-	apiType := c.apiType
 	apiKey := c.apiKey
 	c.mu.RUnlock()
 
-	var healthPath string
-	if apiType == APIOpenAI {
-		healthPath = "/v1/models"
-	} else {
-		healthPath = "/api/tags"
-	}
+	healthPath := "/api/tags"
 
 	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+healthPath, nil)
 	if err != nil {
@@ -242,12 +172,8 @@ func (c *Client) RetryChat(ctx context.Context, model string, messages []Message
 func (c *Client) Chat(ctx context.Context, model string, messages []Message, useJSONMode bool) (*ChatResponse, error) {
 	c.mu.RLock()
 	client := c.httpClient
-	apiType := c.apiType
 	c.mu.RUnlock()
 
-	if apiType == APIOpenAI {
-		return c.chatOpenAI(ctx, client, model, messages, useJSONMode)
-	}
 	return c.chatOllama(ctx, client, model, messages, useJSONMode)
 }
 
@@ -257,6 +183,14 @@ func (c *Client) chatOllama(ctx context.Context, client *http.Client, model stri
 		Model:    model,
 		Messages: messages,
 		Stream:   false, // Non-streaming for simpler parsing
+		Options: map[string]interface{}{
+			"temperature":    c.temperature,
+			"num_predict":    c.numPredict,
+			"top_k":          c.topK,
+			"top_p":          c.topP,
+			"repeat_penalty": c.repeatPenalty,
+			"seed":           c.seed,
+		},
 	}
 
 	if useJSONMode {
@@ -302,81 +236,6 @@ func (c *Client) chatOllama(ctx context.Context, client *http.Client, model stri
 	return &chatResp, nil
 }
 
-// chatOpenAI sends request to OpenAI-compatible endpoint (LM Studio).
-func (c *Client) chatOpenAI(ctx context.Context, client *http.Client, model string, messages []Message, useJSONMode bool) (*ChatResponse, error) {
-	// Convert Ollama Message format to OpenAI format
-	openAIMessages := make([]OpenAIMessage, len(messages))
-	for i, msg := range messages {
-		openAIMessages[i] = OpenAIMessage{Role: msg.Role, Content: msg.Content}
-	}
-
-	req := OpenAIChatRequest{
-		Model:    model,
-		Messages: openAIMessages,
-		Stream:   false,
-	}
-
-	if useJSONMode {
-		// Note: The specific json_schema config may require defining the actual schema tree structure based on LM Studio version
-		// but providing the type as json_schema fulfills the type requirement check initially.
-		// Older/more robust LM studios might natively fall back to generic schema if omitted.
-		req.ResponseFormat = &ResponseFormat{Type: "json_schema"}
-	}
-
-	jsonData, err := json.MarshalIndent(req, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/v1/chat/completions", strings.NewReader(string(jsonData)))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
-
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("HTTP request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
-	}
-
-	var openAIResp OpenAIChatResponse
-	if err := json.Unmarshal(body, &openAIResp); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
-	}
-
-	if len(openAIResp.Choices) == 0 {
-		return nil, fmt.Errorf("empty response from API")
-	}
-
-	content := openAIResp.Choices[0].Message.Content
-
-	// Convert OpenAI response to standard ChatResponse format
-	return &ChatResponse{
-		Model:    openAIResp.Model,
-		Response: content,
-		Done:     true, // OpenAI doesn't stream in this mode
-		Usage: Usage{
-			PromptTokens:   openAIResp.Usage.PromptTokens,
-			ResponseTokens: openAIResp.Usage.ResponseTokens,
-			TotalTokens:    openAIResp.Usage.TotalTokens,
-		},
-	}, nil
-}
-
 // StreamChat sends a message and processes streaming responses.
 // Uses channel-based streaming for non-blocking processing (Go concurrency pattern).
 func (c *Client) StreamChat(ctx context.Context, model string, messages []Message, useJSONMode bool, resultChan chan<- *ChatResponse, errChan chan<- error) {
@@ -391,6 +250,14 @@ func (c *Client) StreamChat(ctx context.Context, model string, messages []Messag
 		Model:    model,
 		Messages: messages,
 		Stream:   true,
+		Options: map[string]interface{}{
+			"temperature":    c.temperature,
+			"num_predict":    c.numPredict,
+			"top_k":          c.topK,
+			"top_p":          c.topP,
+			"repeat_penalty": c.repeatPenalty,
+			"seed":           c.seed,
+		},
 	}
 
 	if useJSONMode {
