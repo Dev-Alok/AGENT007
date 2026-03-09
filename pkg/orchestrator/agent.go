@@ -30,8 +30,10 @@ type Agent struct {
 
 // Message represents a chat message in the conversation history.
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role      string         `json:"role"`
+	Content   string         `json:"content"`
+	ToolCalls []llm.ToolCall `json:"tool_calls,omitempty"`
+	ToolName  string         `json:"tool_name,omitempty"`
 }
 
 // NewAgent creates a new agent with the specified tool registry, LLM endpoint, and model.
@@ -66,11 +68,43 @@ func (a *Agent) SetModel(model string) {
 	a.model = model
 }
 
+// getNativeTools maps internal Registry tools to Ollama native tools schema
+func (a *Agent) getNativeTools() []llm.Tool {
+	var nativeTools []llm.Tool
+	for _, toolName := range a.registry.List() {
+		if t, ok := a.registry.Get(toolName); ok {
+			props := make(map[string]llm.ToolParameterDefinition)
+			for paramName, paramDef := range t.Parameters {
+				props[paramName] = llm.ToolParameterDefinition{
+					Type:        paramDef.Type,
+					Description: paramDef.Description,
+				}
+			}
+
+			nativeTools = append(nativeTools, llm.Tool{
+				Type: "function",
+				Function: llm.ToolFunctionDef{
+					Name:        t.Name,
+					Description: t.Description,
+					Parameters: llm.Parameters{
+						Type:       "object",
+						Properties: props,
+						Required:   t.Required,
+					},
+				},
+			})
+		}
+	}
+	return nativeTools
+}
+
 // Execute runs the agent's main loop for a given task.
 // Returns when task is complete or context is cancelled.
 func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
+	nativeTools := a.getNativeTools()
+
 	// Initialize conversation with system prompt and user task
-	systemPrompt := llm.BuildSystemPrompt(a.registry.List())
+	systemPrompt := llm.BuildSystemPrompt(nativeTools)
 
 	// Add working directory context
 	cwd, err := os.Getwd()
@@ -106,65 +140,28 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 		iteration = i + 1
 
 		// Step 1: Thought - Get LLM response via streaming
-		response, err := a.getLLMResponseStream(ctx, &finalOutput)
+		response, toolCalls, err := a.getLLMResponseStream(ctx, &finalOutput)
 		if err != nil {
 			return finalOutput.String(), fmt.Errorf("LLM error at iteration %d: %w", iteration, err)
 		}
 
-		if strings.Contains(response, "DONE_TASK_COMPLETE") {
-			// Determine final answer part after DONE_TASK_COMPLETE and check if it already printed
-			finalAnswer := strings.TrimSpace(strings.SplitN(response, "DONE_TASK_COMPLETE", 2)[1])
-			if finalAnswer != "" && !strings.Contains(finalOutput.String(), finalAnswer) {
-				msg := fmt.Sprintf("\n\033[36m🤖 Assistant:\033[0m\n%s\n", finalAnswer)
-				fmt.Print(msg)
-				finalOutput.WriteString(msg)
-			}
+		// Append the assistant's unified response once before checking success states
+		a.mu.Lock()
+		a.conversation = append(a.conversation, Message{Role: "assistant", Content: response, ToolCalls: toolCalls})
+		a.mu.Unlock()
+
+		// If zero tool calls, the model decided it was done or wants to talk
+		if len(toolCalls) == 0 {
+			a.mu.Lock()
+			a.reflectionAttempts = make(map[string]int) // Reset on exit
+			a.mu.Unlock()
+
 			msg := "\n✨ Task Complete ✨\n"
 			fmt.Print(msg)
 			finalOutput.WriteString(msg)
 			break
 		}
-
-		// Parse and execute tools
-		toolCalls, err := llm.ParseToolCalls(response)
-		if err != nil {
-			// Track parsing errors specifically to give the LLM a chance to correct hallucinatory output
-			a.mu.Lock()
-			errorKey := "system:parsing_error"
-			attempts := a.reflectionAttempts[errorKey]
-
-			if attempts < 3 {
-				// Retry loop for bad tool formatting
-				reflectionMsg := fmt.Sprintf("Error: Your response was not a valid JSON tool call. %v. REMEMBER: You must respond with ONLY a single valid JSON object representing a tool call, and nothing else.", err)
-				a.conversation = append(a.conversation, Message{Role: "assistant", Content: response})
-				a.conversation = append(a.conversation, Message{Role: "system", Content: reflectionMsg})
-				a.reflectionAttempts[errorKey] = attempts + 1
-				a.mu.Unlock()
-
-				msg := fmt.Sprintf("\n⚠️ LLM Format Error: %v. Retrying (attempt %d/3)...\n", err, attempts+1)
-				fmt.Print(msg)
-				finalOutput.WriteString(msg)
-				continue // Let the LLM try again in the next iteration
-			}
-
-			// If max retries reached, treat as direct conversational response and break
-			a.conversation = append(a.conversation, Message{Role: "assistant", Content: response})
-			a.reflectionAttempts = make(map[string]int) // Reset on exit
-			a.mu.Unlock()
-
-			// Check if we need to print it (might already be printed by stream)
-			if !strings.Contains(finalOutput.String(), response) {
-				msg := fmt.Sprintf("\n\033[36m🤖 Assistant:\033[0m\n%s\n", response)
-				fmt.Print(msg)
-				finalOutput.WriteString(msg)
-			}
-			break
-		}
-
-		// Append the assistant's unified response once before executing tools
-		a.mu.Lock()
-		a.conversation = append(a.conversation, Message{Role: "assistant", Content: response})
-		a.mu.Unlock()
+		// ... Parsing error logic handled inside getLLMResponseStream ...
 
 		// Execute tools concurrently
 		var wg sync.WaitGroup
@@ -175,22 +172,22 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 			go func(toolCall llm.ToolCall) {
 				defer wg.Done()
 
-				tool, ok := a.registry.Get(toolCall.Tool)
+				tool, ok := a.registry.Get(toolCall.Function.Name)
 				if !ok {
-					errMsg := fmt.Sprintf("unknown tool: %s", toolCall.Tool)
+					errMsg := fmt.Sprintf("unknown tool: %s", toolCall.Function.Name)
 					a.mu.Lock()
-					errorKey := fmt.Sprintf("%s:%v", toolCall.Tool, errMsg)
+					errorKey := fmt.Sprintf("%s:%v", toolCall.Function.Name, errMsg)
 					attempts := a.reflectionAttempts[errorKey]
 
 					if attempts < 3 { // Retry loop logic
-						reflectionMsg := fmt.Sprintf("Tool '%s' failed: %s. Attempting correction. REMEMBER: You must respond with ONLY a single valid JSON object. Do not output anything else.", toolCall.Tool, errMsg)
+						reflectionMsg := fmt.Sprintf("Tool '%s' failed: %s. Call a different tool.", toolCall.Function.Name, errMsg)
 						a.conversation = append(a.conversation, Message{Role: "system", Content: reflectionMsg})
 						a.reflectionAttempts[errorKey] = attempts + 1
 					}
 					a.mu.Unlock()
 
 					toolMu.Lock()
-					msg := fmt.Sprintf("\n⚠️ Tool '%s' failed: %v\n", toolCall.Tool, errMsg)
+					msg := fmt.Sprintf("\n⚠️ Tool '%s' failed: %v\n", toolCall.Function.Name, errMsg)
 					fmt.Print(msg)
 					finalOutput.WriteString(msg)
 					toolMu.Unlock()
@@ -198,23 +195,23 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 				}
 
 				// Execute tool
-				result, err := tool.Execute(ctx, toolCall.Args)
+				result, err := tool.Execute(ctx, toolCall.Function.Arguments)
 
 				// Handle Error
 				if err != nil {
 					a.mu.Lock()
-					errorKey := fmt.Sprintf("%s:%v", toolCall.Tool, err)
+					errorKey := fmt.Sprintf("%s:%v", toolCall.Function.Name, err)
 					attempts := a.reflectionAttempts[errorKey]
 
 					if attempts < 3 {
-						reflectionMsg := fmt.Sprintf("Tool '%s' failed with error: %v. Attempting correction. REMEMBER: You must respond with ONLY a single valid JSON object. Do not output anything else.", toolCall.Tool, err)
+						reflectionMsg := fmt.Sprintf("Tool '%s' failed with error: %v. Attempting correction. Provide corrected arguments.", toolCall.Function.Name, err)
 						a.conversation = append(a.conversation, Message{Role: "system", Content: reflectionMsg})
 						a.reflectionAttempts[errorKey] = attempts + 1
 					}
 					a.mu.Unlock()
 
 					toolMu.Lock()
-					msg := fmt.Sprintf("\n⚠️ Tool '%s' failed: %v (attempt %d/3)\n", toolCall.Tool, err, attempts+1)
+					msg := fmt.Sprintf("\n⚠️ Tool '%s' failed: %v (attempt %d/3)\n", toolCall.Function.Name, err, attempts+1)
 					fmt.Print(msg)
 					finalOutput.WriteString(msg)
 					toolMu.Unlock()
@@ -226,25 +223,25 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 
 				// Generate dynamic context-aware message based on the tool executed
 				var dynamicMsg string
-				switch toolCall.Tool {
+				switch toolCall.Function.Name {
 				case "list_directory":
-					dynamicMsg = fmt.Sprintf("Listed directory: %v", toolCall.Args["path"])
+					dynamicMsg = fmt.Sprintf("Listed directory: %v", toolCall.Function.Arguments["path"])
 				case "read_file":
-					dynamicMsg = fmt.Sprintf("Read file: %v", toolCall.Args["path"])
+					dynamicMsg = fmt.Sprintf("Read file: %v", toolCall.Function.Arguments["path"])
 				case "search_file":
-					dynamicMsg = fmt.Sprintf("Searched for file: %v", toolCall.Args["name"])
+					dynamicMsg = fmt.Sprintf("Searched for file: %v", toolCall.Function.Arguments["name"])
 				case "grep_search":
-					dynamicMsg = fmt.Sprintf("Grep searched for \"%v\" in %v", toolCall.Args["query"], toolCall.Args["path"])
+					dynamicMsg = fmt.Sprintf("Grep searched for \"%v\" in %v", toolCall.Function.Arguments["query"], toolCall.Function.Arguments["path"])
 				case "write_file":
-					dynamicMsg = fmt.Sprintf("Wrote to file: %v", toolCall.Args["path"])
+					dynamicMsg = fmt.Sprintf("Wrote to file: %v", toolCall.Function.Arguments["path"])
 				case "replace_file_content":
-					dynamicMsg = fmt.Sprintf("Replaced content in file: %v", toolCall.Args["path"])
+					dynamicMsg = fmt.Sprintf("Replaced content in file: %v", toolCall.Function.Arguments["path"])
 				case "read_url":
-					dynamicMsg = fmt.Sprintf("Fetched URL: %v", toolCall.Args["url"])
+					dynamicMsg = fmt.Sprintf("Fetched URL: %v", toolCall.Function.Arguments["url"])
 				case "run_command":
-					dynamicMsg = fmt.Sprintf("Ran command: %v", toolCall.Args["command"])
+					dynamicMsg = fmt.Sprintf("Ran command: %v", toolCall.Function.Arguments["command"])
 				default:
-					dynamicMsg = fmt.Sprintf("Executed tool: %s", toolCall.Tool)
+					dynamicMsg = fmt.Sprintf("Executed tool: %s", toolCall.Function.Name)
 				}
 
 				msg := fmt.Sprintf("\n✅ \033[32m%s\033[0m\n", dynamicMsg)
@@ -254,7 +251,7 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 
 				a.mu.Lock()
 				a.conversation = append(a.conversation,
-					Message{Role: "tool", Content: fmt.Sprintf("Tool '%s' executed successfully:\n%s", toolCall.Tool, result)},
+					Message{Role: "tool", Content: result, ToolName: toolCall.Function.Name},
 				)
 				a.reflectionAttempts = make(map[string]int) // Reset on success
 				a.mu.Unlock()
@@ -272,7 +269,7 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 }
 
 // getLLMResponseStream sends the conversation to LLM and processes the streamed response.
-func (a *Agent) getLLMResponseStream(ctx context.Context, finalOutput *strings.Builder) (string, error) {
+func (a *Agent) getLLMResponseStream(ctx context.Context, finalOutput *strings.Builder) (string, []llm.ToolCall, error) {
 	a.mu.RLock()
 	conversation := make([]Message, len(a.conversation))
 	copy(conversation, a.conversation)
@@ -284,52 +281,70 @@ func (a *Agent) getLLMResponseStream(ctx context.Context, finalOutput *strings.B
 	for _, msg := range conversation {
 		totalChars += len(msg.Content)
 	}
-	for totalChars > maxChars && len(conversation) > 2 {
-		droppedMsg := conversation[1]
-		totalChars -= len(droppedMsg.Content)
-		conversation = append(conversation[:1], conversation[2:]...)
+	// Drop 2 older messages at a time (pair of user/assistant) to preserve alternating conversational state
+	for totalChars > maxChars && len(conversation) > 3 {
+		droppedMsg1 := conversation[1]
+		droppedMsg2 := conversation[2]
+		totalChars -= (len(droppedMsg1.Content) + len(droppedMsg2.Content))
+		conversation = append(conversation[:1], conversation[3:]...)
 	}
 
 	llmMessages := make([]llm.Message, len(conversation))
 	for i, msg := range conversation {
-		llmMessages[i] = llm.Message{Role: msg.Role, Content: msg.Content}
+		llmMessages[i] = llm.Message{Role: msg.Role, Content: msg.Content, ToolCalls: msg.ToolCalls, ToolName: msg.ToolName}
 	}
+
+	nativeTools := a.getNativeTools()
 
 	resultChan := make(chan *llm.ChatResponse, 100) // Buffer stream
 	errChan := make(chan error, 1)
 
+	// Since Go lacks robust tuple overrides right now without modifying signature, we mutate standard ChatRequest internally
+	a.llmClient.SetTools(nativeTools) // Will create SetTools method
 	go a.llmClient.StreamChat(ctx, a.model, llmMessages, false, resultChan, errChan)
 
 	var fullResponse strings.Builder
+	var finalChunk *llm.ChatResponse
 	formattedThinking := false
 
 	for {
 		select {
 		case err := <-errChan:
 			if err != nil {
-				return "", fmt.Errorf("LLM stream failed: %w", err)
+				return "", nil, fmt.Errorf("LLM stream failed: %w", err)
 			}
-			return fullResponse.String(), nil
+			toolCalls, _ := llm.ExtractToolCalls(finalChunk)
+			return fullResponse.String(), toolCalls, nil
 		case resp, ok := <-resultChan:
 			if !ok {
 				// Channel closed, streaming complete
-				return fullResponse.String(), nil
+				toolCalls, _ := llm.ExtractToolCalls(finalChunk)
+				return fullResponse.String(), toolCalls, nil
 			}
+
+			finalChunk = resp
 
 			// We print just the new chunks to standard output for real time feel
 			if !formattedThinking {
 				fmt.Print("\n\033[36m🤖 Assistant:\033[0m\n")
-				finalOutput.WriteString(fmt.Sprintf("\n\033[36m🤖 Assistant:\033[0m\n"))
+				finalOutput.WriteString("\n\033[36m🤖 Assistant:\033[0m\n")
 				formattedThinking = true
 			}
 
 			// Calculate the diff to print only newly generated characters
-			newContent := strings.TrimPrefix(resp.Response, fullResponse.String())
-			fmt.Print(newContent)
+			newContent := strings.TrimPrefix(resp.Message.Content, fullResponse.String())
+
+			// Highlight <think> tags gracefully. Fast check:
+			displayContent := newContent
+			if strings.Contains(fullResponse.String()+newContent, "<think>") && !strings.Contains(fullResponse.String()+newContent, "</think>") {
+				displayContent = fmt.Sprintf("\033[90m%s\033[0m", newContent) // Dim grey
+			}
+
+			fmt.Print(displayContent)
 			finalOutput.WriteString(newContent)
 			fullResponse.WriteString(newContent)
 		case <-ctx.Done():
-			return fullResponse.String(), ctx.Err()
+			return fullResponse.String(), nil, ctx.Err()
 		}
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -24,6 +25,7 @@ type Client struct {
 	seed          int
 	httpClient    *http.Client
 	mu            sync.RWMutex // Protects client state during reconnection
+	tools         []Tool       // Native tools context optionally set
 }
 
 // ChatRequest represents the request format for Ollama chat endpoint.
@@ -31,42 +33,69 @@ type ChatRequest struct {
 	Model    string                 `json:"model"`
 	Messages []Message              `json:"messages"`
 	Stream   bool                   `json:"stream"`
-	Format   *Format                `json:"format,omitempty"`  // For structured output
+	Format   interface{}            `json:"format,omitempty"`  // Can be "json" or JSON schema object
 	Options  map[string]interface{} `json:"options,omitempty"` // Model options like temperature
+	Tools    []Tool                 `json:"tools,omitempty"`   // Native tool calling definitions
+}
+
+// Tool defines a tool available to the model.
+type Tool struct {
+	Type     string          `json:"type"` // always "function"
+	Function ToolFunctionDef `json:"function"`
+}
+
+// ToolFunctionDef defines a specific function schema.
+type ToolFunctionDef struct {
+	Name        string     `json:"name"`
+	Description string     `json:"description"`
+	Parameters  Parameters `json:"parameters"`
+}
+
+// Parameters defines the JSON schema for function arguments.
+type Parameters struct {
+	Type       string                             `json:"type"` // usually "object"
+	Properties map[string]ToolParameterDefinition `json:"properties"`
+	Required   []string                           `json:"required"`
+}
+
+// ToolParameterDefinition defines argument types.
+type ToolParameterDefinition struct {
+	Type        string `json:"type"`
+	Description string `json:"description"`
 }
 
 // Message represents a chat message in Ollama format.
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-// Format specifies structured output format (JSON for tool calls) - Ollama format.
-type Format struct {
-	Type string `json:"type"` // "json"
+	Role      string     `json:"role"`
+	Content   string     `json:"content"`
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"` // For assistant responses
+	ToolName  string     `json:"tool_name,omitempty"`  // For role="tool"
 }
 
 // ChatResponse represents the response from Ollama.
 type ChatResponse struct {
 	Model     string    `json:"model"`
 	CreatedAt time.Time `json:"created_at"`
-	Response  string    `json:"response"`
+	Message   Message   `json:"message"`
 	Done      bool      `json:"done"`
 	Usage     Usage     `json:"usage,omitempty"`
 }
 
 // Usage contains token usage statistics - Ollama format.
 type Usage struct {
-	PromptTokens   int `json:"prompt_tokens"`
-	ResponseTokens int `json:"response_tokens"`
-	TotalTokens    int `json:"total_tokens"`
+	PromptEvalCount int `json:"prompt_eval_count"`
+	EvalCount       int `json:"eval_count"`
 }
 
-// ToolCall represents a structured tool call from the LLM.
-// This is the output format we expect when using JSON mode.
+// ToolCall represents a structured tool call populated by the LLM natively.
 type ToolCall struct {
-	Tool string                 `json:"tool"`
-	Args map[string]interface{} `json:"args"`
+	Function ToolCallFunction `json:"function"`
+}
+
+// ToolCallFunction holds the native name and arguments chosen by the LLM.
+type ToolCallFunction struct {
+	Name      string                 `json:"name"`
+	Arguments map[string]interface{} `json:"arguments"`
 }
 
 // NewClient creates a new client for Ollama API.
@@ -135,6 +164,13 @@ func (c *Client) HealthCheck(ctx context.Context) error {
 	return nil
 }
 
+// SetTools overrides the tools explicitly sent with each request.
+func (c *Client) SetTools(tools []Tool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.tools = tools
+}
+
 // RetryChat sends a message with retry logic and exponential backoff.
 // Retries up to maxRetries times with increasing delays.
 func (c *Client) RetryChat(ctx context.Context, model string, messages []Message, useJSONMode bool, maxRetries int) (*ChatResponse, error) {
@@ -182,6 +218,7 @@ func (c *Client) chatOllama(ctx context.Context, client *http.Client, model stri
 	req := ChatRequest{
 		Model:    model,
 		Messages: messages,
+		Tools:    c.tools,
 		Stream:   false, // Non-streaming for simpler parsing
 		Options: map[string]interface{}{
 			"temperature":    c.temperature,
@@ -194,8 +231,7 @@ func (c *Client) chatOllama(ctx context.Context, client *http.Client, model stri
 	}
 
 	if useJSONMode {
-		format := Format{Type: "json"}
-		req.Format = &format
+		req.Format = "json"
 	}
 
 	jsonData, err := json.Marshal(req)
@@ -250,6 +286,7 @@ func (c *Client) StreamChat(ctx context.Context, model string, messages []Messag
 		Model:    model,
 		Messages: messages,
 		Stream:   true,
+		Tools:    c.tools,
 		Options: map[string]interface{}{
 			"temperature":    c.temperature,
 			"num_predict":    c.numPredict,
@@ -261,8 +298,7 @@ func (c *Client) StreamChat(ctx context.Context, model string, messages []Messag
 	}
 
 	if useJSONMode {
-		format := Format{Type: "json"}
-		req.Format = &format
+		req.Format = "json"
 	}
 
 	jsonData, err := json.Marshal(req)
@@ -317,15 +353,24 @@ func (c *Client) StreamChat(ctx context.Context, model string, messages []Messag
 			return
 		}
 
-		fullResponse.WriteString(chunk.Response)
+		if len(chunk.Message.ToolCalls) > 0 {
+			log.Printf("DEBUG: Received tool call inside stream! %+v\n", chunk.Message.ToolCalls)
+		}
 
-		// Send intermediate response for real-time feedback
+		fullResponse.WriteString(chunk.Message.Content)
+
+		// Note: For Ollama, ToolCalls are typically generated all at once in the final chunk
+		// or fragmented. We copy any we receive directly to the channel.
 		resultChan <- &ChatResponse{
 			Model:     chunk.Model,
 			CreatedAt: chunk.CreatedAt,
-			Response:  fullResponse.String(),
-			Done:      chunk.Done,
-			Usage:     chunk.Usage,
+			Message: Message{
+				Role:      "assistant",
+				Content:   fullResponse.String(),
+				ToolCalls: chunk.Message.ToolCalls,
+			},
+			Done:  chunk.Done,
+			Usage: chunk.Usage,
 		}
 
 		if chunk.Done {
@@ -339,27 +384,42 @@ func (c *Client) StreamChat(ctx context.Context, model string, messages []Messag
 	}
 }
 
-// ParseToolCalls extracts all valid tool-call JSON objects from LLM text output.
-// Uses brace-depth tracking instead of regex to correctly handle nested JSON (e.g. args with objects).
-func ParseToolCalls(text string) ([]ToolCall, error) {
-	text = strings.TrimSpace(text)
-	var calls []ToolCall
+// ExtractToolCalls retrieves the safe deserialized native tool structs from the final model response chunk.
+func ExtractToolCalls(finalChunk *ChatResponse) ([]ToolCall, error) {
+	if finalChunk == nil {
+		return nil, fmt.Errorf("no tool calls generated by the model")
+	}
 
-	// Extract all top-level JSON objects using brace-depth tracking
-	jsonBlocks := extractJSONBlocks(text)
+	// 1. Check Native Tool Calls (Supported by Llama 3.1+, Mistral, Qwen, etc)
+	if finalChunk.Message.ToolCalls != nil && len(finalChunk.Message.ToolCalls) > 0 {
+		return finalChunk.Message.ToolCalls, nil
+	}
 
-	for _, block := range jsonBlocks {
-		var tc ToolCall
-		if err := json.Unmarshal([]byte(block), &tc); err == nil && tc.Tool != "" {
-			calls = append(calls, tc)
+	// 2. Fallback JSON Parsing (For models like deepseek, glm, or llama2 without native tools)
+	content := finalChunk.Message.Content
+	if strings.Contains(content, "\"tool\"") && strings.Contains(content, "{") {
+		blocks := extractJSONBlocks(content)
+		var calls []ToolCall
+		for _, block := range blocks {
+			var fallback struct {
+				Tool string                 `json:"tool"`
+				Args map[string]interface{} `json:"args"`
+			}
+			if err := json.Unmarshal([]byte(block), &fallback); err == nil && fallback.Tool != "" {
+				calls = append(calls, ToolCall{
+					Function: ToolCallFunction{
+						Name:      fallback.Tool,
+						Arguments: fallback.Args,
+					},
+				})
+			}
+		}
+		if len(calls) > 0 {
+			return calls, nil
 		}
 	}
 
-	if len(calls) == 0 {
-		return nil, fmt.Errorf("no valid tool call found in response")
-	}
-
-	return calls, nil
+	return nil, fmt.Errorf("no tool calls generated by the model")
 }
 
 // extractJSONBlocks finds all top-level JSON objects in a string using brace-depth tracking.
@@ -390,27 +450,35 @@ func extractJSONBlocks(text string) []string {
 	return blocks
 }
 
-// BuildSystemPrompt creates an intelligent system prompt with chain-of-thought reasoning.
-func BuildSystemPrompt(tools []string) string {
-	toolList := strings.Join(tools, ", ")
-	return fmt.Sprintf(`You are an autonomous AI coding agent. You have access to the following tools: %s.
+// BuildSystemPrompt creates an intelligent system prompt.
+// Minimal prompt engineering is needed now because we use explicit structural tool schemas.
+func BuildSystemPrompt(availableTools []Tool) string {
+	var sb strings.Builder
+	sb.WriteString(`You are an autonomous AI coding agent pair-programming with the user.
 
-Your workflow is:
-1. THINK about what you need to do step by step.
-2. Call ONE tool at a time to gather information or make changes.
-3. OBSERVE the result of the tool call.
-4. Repeat until the task is complete.
+Your workflow:
+1. THINK about what you need to do step by step to solve the user's objective.
+2. Observe your available tools, and call exactly ONE tool to gather context or execute an action.
+3. Wait to observe the result of the tool call.
+4. Repeat this chain until the task is complete.
 
-When you need to use a tool, respond with ONLY a single valid JSON object:
+AVAILABLE TOOLS:
+`)
+
+	for _, t := range availableTools {
+		schemaBytes, _ := json.MarshalIndent(t.Function, "", "  ")
+		sb.WriteString(string(schemaBytes))
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString(`
+If the model requires manual tool format usage, respond with ONLY a single valid JSON object representing your tool call:
 {"tool": "tool_name", "args": {"arg1": "value1"}}
 
 CRITICAL RULES:
-- Call only ONE tool per response. Wait for its result before calling the next.
-- NEVER include explanations, markdown, or any text alongside the JSON.
-- ALWAYS use valid JSON with double quotes.
-- Use absolute or relative paths from the current working directory.
-- When you are DONE and have gathered enough information to answer, respond with DONE_TASK_COMPLETE followed by your final answer on the next line.
-- If the user asks a question that does NOT require tools, respond with DONE_TASK_COMPLETE followed by your answer.
-
-Available tools: %s`, toolList, toolList)
+- Use absolute or relative paths from the current working directory for all file operations.
+- Always perform targeted 'grep_search' queries instead of dumping whole codebases.
+- Your thinking process should be outputted within <think> tags.
+`)
+	return sb.String()
 }

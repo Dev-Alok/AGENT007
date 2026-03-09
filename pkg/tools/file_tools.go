@@ -14,11 +14,19 @@ import (
 	"time"
 )
 
+// ToolParameter defines the type and description of a parameter
+type ToolParameter struct {
+	Type        string `json:"type"`
+	Description string `json:"description"`
+}
+
 // Tool represents a callable tool with name and execution function.
 // Using struct instead of interface{} for type safety (Go vs JS dynamic typing).
 type Tool struct {
 	Name        string
 	Description string
+	Parameters  map[string]ToolParameter
+	Required    []string
 	Execute     func(ctx context.Context, args map[string]interface{}) (string, error)
 }
 
@@ -70,6 +78,10 @@ func ReadFileTool() Tool {
 	return Tool{
 		Name:        "read_file",
 		Description: "Read the contents of a file at the specified path. Requires argument: 'path' (string).",
+		Parameters: map[string]ToolParameter{
+			"path": {Type: "string", Description: "The absolute or relative path to the file to read."},
+		},
+		Required: []string{"path"},
 		Execute: func(ctx context.Context, args map[string]interface{}) (string, error) {
 			path, ok := args["path"].(string)
 			if !ok || path == "" {
@@ -102,6 +114,11 @@ func WriteFileTool() Tool {
 	return Tool{
 		Name:        "write_file",
 		Description: "Write content to a file. Requires arguments: 'path' (string) and 'content' (string).",
+		Parameters: map[string]ToolParameter{
+			"path":    {Type: "string", Description: "The absolute or relative path to the file to write to."},
+			"content": {Type: "string", Description: "The content to write to the file."},
+		},
+		Required: []string{"path", "content"},
 		Execute: func(ctx context.Context, args map[string]interface{}) (string, error) {
 			path, ok := args["path"].(string)
 			if !ok || path == "" {
@@ -133,6 +150,10 @@ func RunCommandTool() Tool {
 	return Tool{
 		Name:        "run_command",
 		Description: "Execute a shell command and return its output. Requires argument: 'command' (string).",
+		Parameters: map[string]ToolParameter{
+			"command": {Type: "string", Description: "The command line string to execute in the terminal."},
+		},
+		Required: []string{"command"},
 		Execute: func(ctx context.Context, args map[string]interface{}) (string, error) {
 			cmdStr, ok := args["command"].(string)
 			if !ok || cmdStr == "" {
@@ -177,6 +198,10 @@ func ListDirectoryTool() Tool {
 	return Tool{
 		Name:        "list_directory",
 		Description: "List files and directories at the specified path. Requires argument: 'path' (string).",
+		Parameters: map[string]ToolParameter{
+			"path": {Type: "string", Description: "The path of the directory to list files for."},
+		},
+		Required: []string{"path"},
 		Execute: func(ctx context.Context, args map[string]interface{}) (string, error) {
 			path, ok := args["path"].(string)
 			if !ok || path == "" {
@@ -220,6 +245,10 @@ func SearchFileTool() Tool {
 	return Tool{
 		Name:        "search_file",
 		Description: "Search for a file by exact name in the workspace. Requires argument: 'name' (string).",
+		Parameters: map[string]ToolParameter{
+			"name": {Type: "string", Description: "The exact name of the file to search for."},
+		},
+		Required: []string{"name"},
 		Execute: func(ctx context.Context, args map[string]interface{}) (string, error) {
 			filename, ok := args["name"].(string)
 			if !ok || filename == "" {
@@ -258,6 +287,11 @@ func GrepSearchTool() Tool {
 	return Tool{
 		Name:        "grep_search",
 		Description: "Search for a regex pattern in files. Requires arguments: 'path' (directory to search) and 'query' (regex string).",
+		Parameters: map[string]ToolParameter{
+			"path":  {Type: "string", Description: "The directory to search inside."},
+			"query": {Type: "string", Description: "The regex string query to search for."},
+		},
+		Required: []string{"path", "query"},
 		Execute: func(ctx context.Context, args map[string]interface{}) (string, error) {
 			path, okPath := args["path"].(string)
 			if !okPath || path == "" {
@@ -321,6 +355,12 @@ func ReplaceFileContentTool() Tool {
 	return Tool{
 		Name:        "replace_file_content",
 		Description: "Replaces target string with replacement string in a file. Requires arguments: 'path', 'target', and 'replacement'.",
+		Parameters: map[string]ToolParameter{
+			"path":        {Type: "string", Description: "The absolute or relative path to the file to modify."},
+			"target":      {Type: "string", Description: "The exact string content to find and replace."},
+			"replacement": {Type: "string", Description: "The string content to replace it with."},
+		},
+		Required: []string{"path", "target", "replacement"},
 		Execute: func(ctx context.Context, args map[string]interface{}) (string, error) {
 			path, okPath := args["path"].(string)
 			target, okTarget := args["target"].(string)
@@ -356,6 +396,10 @@ func ReadURLTool() Tool {
 	return Tool{
 		Name:        "read_url",
 		Description: "Fetch content from a web URL. Requires argument: 'url' (string).",
+		Parameters: map[string]ToolParameter{
+			"url": {Type: "string", Description: "The HTTP/HTTPS URL to read."},
+		},
+		Required: []string{"url"},
 		Execute: func(ctx context.Context, args map[string]interface{}) (string, error) {
 			url, ok := args["url"].(string)
 			if !ok || url == "" {
