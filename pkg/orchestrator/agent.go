@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"agentic-coder/pkg/config"
 	"agentic-coder/pkg/llm"
 	"agentic-coder/pkg/tools"
 )
@@ -36,27 +37,26 @@ type Message struct {
 	ToolName  string         `json:"tool_name,omitempty"`
 }
 
-// NewAgent creates a new agent with the specified tool registry, LLM endpoint, and model.
-// contextWindow limits token usage to prevent runaway costs (performance optimization).
-func NewAgent(registry *tools.Registry, contextWindow int, llmEndpoint, apiKey, model string, temperature float32, numPredict, topK int, topP, repeatPenalty float32, seed int) *Agent {
+// NewAgent creates a new agent with the specified tool registry and configuration.
+func NewAgent(registry *tools.Registry, cfg *config.AgentConfig) *Agent {
 	return &Agent{
 		registry:           registry,
-		llmClient:          llm.NewClient(llmEndpoint, apiKey, temperature, numPredict, topK, topP, repeatPenalty, seed), // Supports Ollama
-		model:              model,
-		contextWindow:      contextWindow,
-		maxIterations:      5, // Prevent infinite loops
+		llmClient:          llm.NewClient(cfg.LLMEndpoint, cfg.APIKey, llm.ProviderType(cfg.Provider), cfg.Temperature, cfg.NumPredict, cfg.TopK, cfg.TopP, cfg.RepeatPenalty, cfg.Seed),
+		model:              cfg.Model,
+		contextWindow:      cfg.ContextWindow,
+		maxIterations:      5,
 		reflectionAttempts: make(map[string]int),
 	}
 }
 
 // NewAgentWithTimeout creates a new agent with custom timeout.
-func NewAgentWithTimeout(registry *tools.Registry, contextWindow int, llmEndpoint, apiKey, model string, temperature float32, numPredict, topK int, topP, repeatPenalty float32, seed int, timeout time.Duration) *Agent {
+func NewAgentWithTimeout(registry *tools.Registry, cfg *config.AgentConfig, timeout time.Duration) *Agent {
 	return &Agent{
 		registry:           registry,
-		llmClient:          llm.NewClientWithTimeout(llmEndpoint, apiKey, temperature, numPredict, topK, topP, repeatPenalty, seed, timeout),
-		model:              model,
-		contextWindow:      contextWindow,
-		maxIterations:      5, // Prevent infinite loops
+		llmClient:          llm.NewClientWithTimeout(cfg.LLMEndpoint, cfg.APIKey, llm.ProviderType(cfg.Provider), cfg.Temperature, cfg.NumPredict, cfg.TopK, cfg.TopP, cfg.RepeatPenalty, cfg.Seed, timeout),
+		model:              cfg.Model,
+		contextWindow:      cfg.ContextWindow,
+		maxIterations:      5,
 		reflectionAttempts: make(map[string]int),
 	}
 }
@@ -68,7 +68,7 @@ func (a *Agent) SetModel(model string) {
 	a.model = model
 }
 
-// getNativeTools maps internal Registry tools to Ollama native tools schema
+// getNativeTools maps internal Registry tools to LLM-native tool schemas.
 func (a *Agent) getNativeTools() []llm.Tool {
 	var nativeTools []llm.Tool
 	for _, toolName := range a.registry.List() {

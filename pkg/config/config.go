@@ -4,44 +4,54 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
+)
+
+type ProviderType string
+
+const (
+	ProviderLMStudio ProviderType = "lmstudio"
+	ProviderOllama   ProviderType = "ollama"
 )
 
 // AgentConfig represents the configuration layout for the agent application.
 // Used instead of CLI flags to support easy profile switching.
 type AgentConfig struct {
-	LLMEndpoint       string  `json:"llm_endpoint"`
-	Model             string  `json:"model"`
-	ContextWindow     int     `json:"context_window"`
-	Temperature       float32 `json:"temperature"`
-	NumPredict        int     `json:"num_predict"`
-	TopK              int     `json:"top_k"`
-	TopP              float32 `json:"top_p"`
-	RepeatPenalty     float32 `json:"repeat_penalty"`
-	Seed              int     `json:"seed"`
-	LLMTimeoutSeconds int     `json:"llm_timeout_seconds"`
+	LLMEndpoint       string        `json:"llm_endpoint"`
+	Model             string        `json:"model"`
+	ContextWindow     int           `json:"context_window"`
+	Temperature       float32       `json:"temperature"`
+	NumPredict        int           `json:"num_predict"`
+	TopK              int           `json:"top_k"`
+	TopP              float32       `json:"top_p"`
+	RepeatPenalty     float32       `json:"repeat_penalty"`
+	Seed              int           `json:"seed"`
+	LLMTimeoutSeconds int           `json:"llm_timeout_seconds"`
+	Provider          ProviderType  `json:"provider"`
+	APIKey            string        `json:"api_key,omitempty"`
 }
 
 // LoadConfig parses a config.json file and returns an initialized AgentConfig.
 // It applies safe defaults so the application can still boot if attributes are missing.
 func LoadConfig(filePath string) (*AgentConfig, error) {
-	// Provide sane defaults if parsing is fully omitted
 	cfg := &AgentConfig{
-		LLMEndpoint:       "http://localhost:11434",
-		Model:             "llama2",
+		LLMEndpoint:       "http://localhost:1234",
+		Model:             "default-model",
 		ContextWindow:     5000,
 		Temperature:       0.7,
-		NumPredict:        1000,
+		NumPredict:        -1,
 		TopK:              40,
 		TopP:              0.9,
 		RepeatPenalty:     1.1,
 		Seed:              0,
-		LLMTimeoutSeconds: 30,
+		LLMTimeoutSeconds: 300,
+		Provider:          ProviderLMStudio,
+		APIKey:            "",
 	}
 
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// If no config file exists, return the defaults
 			return cfg, nil
 		}
 		return nil, fmt.Errorf("failed to read configuration file: %w", err)
@@ -51,5 +61,28 @@ func LoadConfig(filePath string) (*AgentConfig, error) {
 		return nil, fmt.Errorf("failed to parse configuration file JSON: %w", err)
 	}
 
+	cfg.LLMEndpoint = normalizeEndpoint(cfg.LLMEndpoint, cfg.Provider)
+
 	return cfg, nil
+}
+
+func normalizeEndpoint(endpoint string, provider ProviderType) string {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return "http://localhost:1234"
+	}
+
+	switch provider {
+	case ProviderOllama:
+		endpoint = strings.TrimSuffix(endpoint, "/")
+		return endpoint
+	default:
+		endpoint = strings.TrimSuffix(endpoint, "/")
+		if !strings.Contains(endpoint, ":1234") && !strings.Contains(endpoint, ":11434") {
+			if !strings.HasSuffix(endpoint, "/v1") {
+				endpoint = endpoint + "/v1"
+			}
+		}
+		return endpoint
+	}
 }

@@ -13,10 +13,17 @@ import (
 	"time"
 )
 
-// Client handles HTTP communication with Ollama.
+type ProviderType string
+
+const (
+	ProviderLMStudio ProviderType = "lmstudio"
+	ProviderOpenAI   ProviderType = "openai"
+)
+
 type Client struct {
 	baseURL       string
 	apiKey        string
+	provider      ProviderType
 	temperature   float32
 	numPredict    int
 	topK          int
@@ -24,55 +31,57 @@ type Client struct {
 	repeatPenalty float32
 	seed          int
 	httpClient    *http.Client
-	mu            sync.RWMutex // Protects client state during reconnection
-	tools         []Tool       // Native tools context optionally set
+	mu            sync.RWMutex
+	tools         []Tool
 }
 
-// ChatRequest represents the request format for Ollama chat endpoint.
 type ChatRequest struct {
 	Model    string                 `json:"model"`
 	Messages []Message              `json:"messages"`
 	Stream   bool                   `json:"stream"`
-	Format   interface{}            `json:"format,omitempty"`  // Can be "json" or JSON schema object
-	Options  map[string]interface{} `json:"options,omitempty"` // Model options like temperature
-	Tools    []Tool                 `json:"tools,omitempty"`   // Native tool calling definitions
+	Format   interface{}            `json:"format,omitempty"`
+	Options  map[string]interface{} `json:"options,omitempty"`
+	Tools    []Tool                 `json:"tools,omitempty"`
 }
 
-// Tool defines a tool available to the model.
+type LMStudioChatRequest struct {
+	Model    string                 `json:"model"`
+	Messages []Message              `json:"messages"`
+	Stream   bool                   `json:"stream"`
+	Format   interface{}            `json:"format,omitempty"`
+	Options  map[string]interface{} `json:"options,omitempty"`
+	Tools    []Tool                 `json:"tools,omitempty"`
+}
+
 type Tool struct {
-	Type     string          `json:"type"` // always "function"
+	Type     string          `json:"type"`
 	Function ToolFunctionDef `json:"function"`
 }
 
-// ToolFunctionDef defines a specific function schema.
 type ToolFunctionDef struct {
 	Name        string     `json:"name"`
 	Description string     `json:"description"`
 	Parameters  Parameters `json:"parameters"`
 }
 
-// Parameters defines the JSON schema for function arguments.
 type Parameters struct {
-	Type       string                             `json:"type"` // usually "object"
+	Type       string                             `json:"type"`
 	Properties map[string]ToolParameterDefinition `json:"properties"`
 	Required   []string                           `json:"required"`
 }
 
-// ToolParameterDefinition defines argument types.
 type ToolParameterDefinition struct {
 	Type        string `json:"type"`
 	Description string `json:"description"`
 }
 
-// Message represents a chat message in Ollama format.
 type Message struct {
 	Role      string     `json:"role"`
 	Content   string     `json:"content"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"` // For assistant responses
-	ToolName  string     `json:"tool_name,omitempty"`  // For role="tool"
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	ToolName  string     `json:"tool_name,omitempty"`
 }
 
-// ChatResponse represents the response from Ollama.
 type ChatResponse struct {
 	Model     string    `json:"model"`
 	CreatedAt time.Time `json:"created_at"`
@@ -81,28 +90,25 @@ type ChatResponse struct {
 	Usage     Usage     `json:"usage,omitempty"`
 }
 
-// Usage contains token usage statistics - Ollama format.
 type Usage struct {
 	PromptEvalCount int `json:"prompt_eval_count"`
 	EvalCount       int `json:"eval_count"`
 }
 
-// ToolCall represents a structured tool call populated by the LLM natively.
 type ToolCall struct {
 	Function ToolCallFunction `json:"function"`
 }
 
-// ToolCallFunction holds the native name and arguments chosen by the LLM.
 type ToolCallFunction struct {
 	Name      string                 `json:"name"`
 	Arguments map[string]interface{} `json:"arguments"`
 }
 
-// NewClient creates a new client for Ollama API.
-func NewClient(baseURL, apiKey string, temperature float32, numPredict, topK int, topP, repeatPenalty float32, seed int) *Client {
+func NewClient(baseURL, apiKey string, provider ProviderType, temperature float32, numPredict, topK int, topP, repeatPenalty float32, seed int) *Client {
 	return &Client{
-		baseURL:       baseURL,
+		baseURL:       strings.TrimSuffix(baseURL, "/"),
 		apiKey:        apiKey,
+		provider:      provider,
 		temperature:   temperature,
 		numPredict:    numPredict,
 		topK:          topK,
@@ -110,16 +116,16 @@ func NewClient(baseURL, apiKey string, temperature float32, numPredict, topK int
 		repeatPenalty: repeatPenalty,
 		seed:          seed,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second, // Prevent indefinite hangs
+			Timeout: 30 * time.Second,
 		},
 	}
 }
 
-// NewClientWithTimeout creates a new client with custom timeout.
-func NewClientWithTimeout(baseURL, apiKey string, temperature float32, numPredict, topK int, topP, repeatPenalty float32, seed int, timeout time.Duration) *Client {
+func NewClientWithTimeout(baseURL, apiKey string, provider ProviderType, temperature float32, numPredict, topK int, topP, repeatPenalty float32, seed int, timeout time.Duration) *Client {
 	return &Client{
-		baseURL:       baseURL,
+		baseURL:       strings.TrimSuffix(baseURL, "/"),
 		apiKey:        apiKey,
+		provider:      provider,
 		temperature:   temperature,
 		numPredict:    numPredict,
 		topK:          topK,
@@ -132,15 +138,18 @@ func NewClientWithTimeout(baseURL, apiKey string, temperature float32, numPredic
 	}
 }
 
-// HealthCheck verifies that the LLM server is running and accessible.
-// Returns true if server is healthy, false otherwise.
 func (c *Client) HealthCheck(ctx context.Context) error {
 	c.mu.RLock()
 	client := c.httpClient
 	apiKey := c.apiKey
 	c.mu.RUnlock()
 
-	healthPath := "/api/tags"
+	var healthPath string
+	if c.provider == ProviderLMStudio {
+		healthPath = "/v1/models"
+	} else {
+		healthPath = "/api/tags"
+	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+healthPath, nil)
 	if err != nil {
@@ -157,28 +166,24 @@ func (c *Client) HealthCheck(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
 		return fmt.Errorf("server returned status %d", resp.StatusCode)
 	}
 
 	return nil
 }
 
-// SetTools overrides the tools explicitly sent with each request.
 func (c *Client) SetTools(tools []Tool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.tools = tools
 }
 
-// RetryChat sends a message with retry logic and exponential backoff.
-// Retries up to maxRetries times with increasing delays.
 func (c *Client) RetryChat(ctx context.Context, model string, messages []Message, useJSONMode bool, maxRetries int) (*ChatResponse, error) {
 	var lastErr error
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
-			// Exponential backoff: 1s, 2s, 4s, 8s, etc.
 			delay := time.Duration(1<<uint(attempt-1)) * time.Second
 			select {
 			case <-time.After(delay):
@@ -194,7 +199,6 @@ func (c *Client) RetryChat(ctx context.Context, model string, messages []Message
 
 		lastErr = err
 
-		// Don't retry on timeout or context cancellation
 		if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "context") {
 			break
 		}
@@ -203,23 +207,82 @@ func (c *Client) RetryChat(ctx context.Context, model string, messages []Message
 	return nil, fmt.Errorf("after %d attempts: %w", maxRetries+1, lastErr)
 }
 
-// Chat sends a message to the LLM and returns the response.
-// Uses context for timeout/cancellation propagation (Go idiom).
 func (c *Client) Chat(ctx context.Context, model string, messages []Message, useJSONMode bool) (*ChatResponse, error) {
 	c.mu.RLock()
 	client := c.httpClient
 	c.mu.RUnlock()
 
+	if c.provider == ProviderLMStudio {
+		return c.chatLMStudio(ctx, client, model, messages, useJSONMode)
+	}
+
 	return c.chatOllama(ctx, client, model, messages, useJSONMode)
 }
 
-// chatOllama sends request to Ollama-compatible endpoint.
+func (c *Client) chatLMStudio(ctx context.Context, client *http.Client, model string, messages []Message, useJSONMode bool) (*ChatResponse, error) {
+	req := LMStudioChatRequest{
+		Model:    model,
+		Messages: messages,
+		Tools:    c.tools,
+		Stream:   false,
+		Options: map[string]interface{}{
+			"temperature":    c.temperature,
+			"num_predict":    c.numPredict,
+			"top_k":          c.topK,
+			"top_p":          c.topP,
+			"repeat_penalty": c.repeatPenalty,
+			"seed":           c.seed,
+		},
+	}
+
+	if useJSONMode {
+		req.Format = "json"
+	}
+
+	jsonData, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/v1/chat/completions", strings.NewReader(string(jsonData)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var chatResp ChatResponse
+	if err := json.Unmarshal(body, &chatResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	return &chatResp, nil
+}
+
 func (c *Client) chatOllama(ctx context.Context, client *http.Client, model string, messages []Message, useJSONMode bool) (*ChatResponse, error) {
 	req := ChatRequest{
 		Model:    model,
 		Messages: messages,
 		Tools:    c.tools,
-		Stream:   false, // Non-streaming for simpler parsing
+		Stream:   false,
 		Options: map[string]interface{}{
 			"temperature":    c.temperature,
 			"num_predict":    c.numPredict,
@@ -272,8 +335,6 @@ func (c *Client) chatOllama(ctx context.Context, client *http.Client, model stri
 	return &chatResp, nil
 }
 
-// StreamChat sends a message and processes streaming responses.
-// Uses channel-based streaming for non-blocking processing (Go concurrency pattern).
 func (c *Client) StreamChat(ctx context.Context, model string, messages []Message, useJSONMode bool, resultChan chan<- *ChatResponse, errChan chan<- error) {
 	defer close(resultChan)
 	defer close(errChan)
@@ -282,6 +343,124 @@ func (c *Client) StreamChat(ctx context.Context, model string, messages []Messag
 	client := c.httpClient
 	c.mu.RUnlock()
 
+	if c.provider == ProviderLMStudio {
+		c.streamLMStudio(ctx, client, model, messages, useJSONMode, resultChan, errChan)
+	} else {
+		c.streamOllama(ctx, client, model, messages, useJSONMode, resultChan, errChan)
+	}
+}
+
+func (c *Client) streamLMStudio(ctx context.Context, client *http.Client, model string, messages []Message, useJSONMode bool, resultChan chan<- *ChatResponse, errChan chan<- error) {
+	req := LMStudioChatRequest{
+		Model:    model,
+		Messages: messages,
+		Tools:    c.tools,
+		Stream:   true,
+		Options: map[string]interface{}{
+			"temperature":    c.temperature,
+			"num_predict":    c.numPredict,
+			"top_k":          c.topK,
+			"top_p":          c.topP,
+			"repeat_penalty": c.repeatPenalty,
+			"seed":           c.seed,
+		},
+	}
+
+	if useJSONMode {
+		req.Format = "json"
+	}
+
+	jsonData, err := json.Marshal(req)
+	if err != nil {
+		errChan <- fmt.Errorf("failed to marshal request: %w", err)
+		return
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/v1/chat/completions", strings.NewReader(string(jsonData)))
+	if err != nil {
+		errChan <- fmt.Errorf("failed to create HTTP request: %w", err)
+		return
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		errChan <- fmt.Errorf("HTTP request failed: %w", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		errChan <- fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+		return
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	var fullResponse strings.Builder
+
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			errChan <- ctx.Err()
+			return
+		default:
+		}
+
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
+		lineStr := strings.TrimSpace(string(line))
+		if lineStr == "data: [DONE]" || lineStr == "[DONE]" {
+			break
+		}
+
+		if strings.HasPrefix(lineStr, "data: ") {
+			lineStr = lineStr[6:]
+		}
+
+		var chunk ChatResponse
+		if err := json.Unmarshal([]byte(lineStr), &chunk); err != nil {
+			log.Printf("Warning: failed to parse stream chunk: %v", err)
+			continue
+		}
+
+		if len(chunk.Message.ToolCalls) > 0 {
+			log.Printf("DEBUG: Received tool call inside stream! %+v\n", chunk.Message.ToolCalls)
+		}
+
+		fullResponse.WriteString(chunk.Message.Content)
+
+		resultChan <- &ChatResponse{
+			Model:     chunk.Model,
+			CreatedAt: chunk.CreatedAt,
+			Message: Message{
+				Role:      "assistant",
+				Content:   fullResponse.String(),
+				ToolCalls: chunk.Message.ToolCalls,
+			},
+			Done:  chunk.Done,
+			Usage: chunk.Usage,
+		}
+
+		if chunk.Done {
+			break
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		errChan <- fmt.Errorf("stream reading error: %w", err)
+		return
+	}
+}
+
+func (c *Client) streamOllama(ctx context.Context, client *http.Client, model string, messages []Message, useJSONMode bool, resultChan chan<- *ChatResponse, errChan chan<- error) {
 	req := ChatRequest{
 		Model:    model,
 		Messages: messages,
@@ -359,8 +538,6 @@ func (c *Client) StreamChat(ctx context.Context, model string, messages []Messag
 
 		fullResponse.WriteString(chunk.Message.Content)
 
-		// Note: For Ollama, ToolCalls are typically generated all at once in the final chunk
-		// or fragmented. We copy any we receive directly to the channel.
 		resultChan <- &ChatResponse{
 			Model:     chunk.Model,
 			CreatedAt: chunk.CreatedAt,
@@ -384,18 +561,15 @@ func (c *Client) StreamChat(ctx context.Context, model string, messages []Messag
 	}
 }
 
-// ExtractToolCalls retrieves the safe deserialized native tool structs from the final model response chunk.
 func ExtractToolCalls(finalChunk *ChatResponse) ([]ToolCall, error) {
 	if finalChunk == nil {
 		return nil, fmt.Errorf("no tool calls generated by the model")
 	}
 
-	// 1. Check Native Tool Calls (Supported by Llama 3.1+, Mistral, Qwen, etc)
 	if finalChunk.Message.ToolCalls != nil && len(finalChunk.Message.ToolCalls) > 0 {
 		return finalChunk.Message.ToolCalls, nil
 	}
 
-	// 2. Fallback JSON Parsing (For models like deepseek, glm, or llama2 without native tools)
 	content := finalChunk.Message.Content
 	if strings.Contains(content, "\"tool\"") && strings.Contains(content, "{") {
 		blocks := extractJSONBlocks(content)
@@ -422,8 +596,6 @@ func ExtractToolCalls(finalChunk *ChatResponse) ([]ToolCall, error) {
 	return nil, fmt.Errorf("no tool calls generated by the model")
 }
 
-// extractJSONBlocks finds all top-level JSON objects in a string using brace-depth tracking.
-// This correctly handles nested objects like {"tool": "x", "args": {"path": "y"}}.
 func extractJSONBlocks(text string) []string {
 	var blocks []string
 	depth := 0
@@ -450,8 +622,6 @@ func extractJSONBlocks(text string) []string {
 	return blocks
 }
 
-// BuildSystemPrompt creates an intelligent system prompt.
-// Minimal prompt engineering is needed now because we use explicit structural tool schemas.
 func BuildSystemPrompt(availableTools []Tool) string {
 	var sb strings.Builder
 	sb.WriteString(`You are an autonomous AI coding agent pair-programming with the user.
