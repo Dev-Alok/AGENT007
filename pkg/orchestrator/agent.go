@@ -1,8 +1,5 @@
 package orchestrator
 
-// IMPORTANT: All output must go through streamCallback - NO direct fmt.Print or os.Stdout!
-// This ensures all output is handled by the TUI for proper formatting and display.
-
 import (
 	"context"
 	"encoding/json"
@@ -17,10 +14,49 @@ import (
 	"agentic-coder/pkg/tools"
 )
 
-// StreamCallback is a function that receives chunks of streaming output
+type EventType string
+
+const (
+	EventThinking   EventType = "thinking"
+	EventPlanning   EventType = "planning"
+	EventToolCall   EventType = "tool_call"
+	EventToolResult EventType = "tool_result"
+	EventToolError  EventType = "tool_error"
+	EventIteration  EventType = "iteration"
+	EventComplete   EventType = "complete"
+	EventStream     EventType = "stream"
+	EventRetry      EventType = "retry"
+	EventStatus     EventType = "status"
+)
+
+type AgentEvent struct {
+	Type      EventType       `json:"type"`
+	Message   string          `json:"message"`
+	Metadata  json.RawMessage `json:"metadata,omitempty"`
+	Timestamp time.Time       `json:"timestamp"`
+}
+
+type ToolCallMeta struct {
+	ToolName string                 `json:"tool_name"`
+	Args     map[string]interface{} `json:"args,omitempty"`
+}
+
+type IterationMeta struct {
+	Current int `json:"current"`
+	Max     int `json:"max"`
+}
+
+type RetryMeta struct {
+	ToolName    string `json:"tool_name"`
+	Attempt     int    `json:"attempt"`
+	MaxAttempts int    `json:"max_attempts"`
+	Error       string `json:"error"`
+}
+
 type StreamCallback func(content string)
 
-// Agent manages the conversation state and implements the Thought->Action->Observation loop.
+type EventCallback func(event AgentEvent)
+
 type Agent struct {
 	registry      *tools.Registry
 	llmClient     *llm.Client
@@ -33,9 +69,9 @@ type Agent struct {
 
 	reflectionAttempts map[string]int
 	streamCallback     StreamCallback
+	eventCallback      EventCallback
 }
 
-// Message represents a chat message in the conversation history.
 type Message struct {
 	Role       string         `json:"role"`
 	Content    string         `json:"content"`
@@ -44,7 +80,6 @@ type Message struct {
 	ToolName   string         `json:"tool_name,omitempty"`
 }
 
-// NewAgent creates a new agent with the specified tool registry and configuration.
 func NewAgent(registry *tools.Registry, cfg *config.AgentConfig) *Agent {
 	maxIter := cfg.MaxIterations
 	if maxIter <= 0 {
@@ -60,7 +95,6 @@ func NewAgent(registry *tools.Registry, cfg *config.AgentConfig) *Agent {
 	}
 }
 
-// NewAgentWithTimeout creates a new agent with custom timeout.
 func NewAgentWithTimeout(registry *tools.Registry, cfg *config.AgentConfig, timeout time.Duration) *Agent {
 	maxIter := cfg.MaxIterations
 	if maxIter <= 0 {
@@ -76,21 +110,46 @@ func NewAgentWithTimeout(registry *tools.Registry, cfg *config.AgentConfig, time
 	}
 }
 
-// SetModel allows changing the LLM model at runtime.
 func (a *Agent) SetModel(model string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.model = model
 }
 
-// SetStreamCallback sets a callback for streaming output
 func (a *Agent) SetStreamCallback(callback StreamCallback) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.streamCallback = callback
 }
 
-// stream writes content to the callback if available
+func (a *Agent) SetEventCallback(callback EventCallback) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.eventCallback = callback
+}
+
+func (a *Agent) emit(event AgentEvent) {
+	a.mu.RLock()
+	callback := a.eventCallback
+	a.mu.RUnlock()
+	if callback != nil {
+		callback(event)
+	}
+}
+
+func (a *Agent) emitWithMeta(eventType EventType, message string, meta interface{}) {
+	var metaBytes []byte
+	if meta != nil {
+		metaBytes, _ = json.Marshal(meta)
+	}
+	a.emit(AgentEvent{
+		Type:      eventType,
+		Message:   message,
+		Metadata:  metaBytes,
+		Timestamp: time.Now(),
+	})
+}
+
 func (a *Agent) stream(content string) {
 	a.mu.RLock()
 	callback := a.streamCallback
@@ -100,7 +159,6 @@ func (a *Agent) stream(content string) {
 	}
 }
 
-// getNativeTools maps internal Registry tools to LLM-native tool schemas.
 func (a *Agent) getNativeTools() []llm.Tool {
 	var nativeTools []llm.Tool
 	for _, toolName := range a.registry.List() {
@@ -130,29 +188,25 @@ func (a *Agent) getNativeTools() []llm.Tool {
 	return nativeTools
 }
 
-// Execute runs the agent's main loop for a given task.
-// Returns when task is complete or context is cancelled.
-// Each execution starts fresh with no conversation history.
-// Output is returned to the caller (TUI handles rendering).
 func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 	nativeTools := a.getNativeTools()
 
-	// Initialize conversation with system prompt and user task (fresh each time)
 	systemPrompt := llm.BuildSystemPrompt(nativeTools)
 
-	// Add working directory context
 	cwd, err := os.Getwd()
 	if err == nil {
 		systemPrompt += fmt.Sprintf("\n\nCurrent working directory: %s", cwd)
 	}
 
 	a.mu.Lock()
-	// Always start fresh - no conversation history
 	a.conversation = []Message{
 		{Role: "system", Content: systemPrompt},
 		{Role: "user", Content: task},
 	}
 	a.mu.Unlock()
+
+	a.emitWithMeta(EventStatus, "Starting agent execution...", IterationMeta{Current: 0, Max: a.maxIterations})
+	a.emitWithMeta(EventPlanning, fmt.Sprintf("Task: %s", task), nil)
 
 	var finalOutput strings.Builder
 	var iteration int
@@ -160,20 +214,21 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 	for i := 0; i < a.maxIterations; i++ {
 		select {
 		case <-ctx.Done():
+			a.emitWithMeta(EventStatus, "Execution cancelled", nil)
 			return finalOutput.String(), ctx.Err()
 		default:
 		}
 
 		iteration = i + 1
+		a.emitWithMeta(EventIteration, fmt.Sprintf("Iteration %d/%d", iteration, a.maxIterations), IterationMeta{Current: iteration, Max: a.maxIterations})
+		a.emitWithMeta(EventThinking, "Analyzing task and planning next step...", nil)
 
-		// Step 1: Thought - Get LLM response via streaming
 		response, toolCalls, err := a.getLLMResponseStream(ctx, &finalOutput, a.streamCallback)
 		if err != nil {
+			a.emitWithMeta(EventStatus, fmt.Sprintf("LLM error at iteration %d: %v", iteration, err), nil)
 			return finalOutput.String(), fmt.Errorf("LLM error at iteration %d: %w", iteration, err)
 		}
 
-		// Append the assistant's unified response once before checking success states
-		// Convert tool calls to have proper map arguments for serialization
 		normalizedToolCalls := make([]llm.ToolCall, len(toolCalls))
 		for i, tc := range toolCalls {
 			normalizedToolCalls[i] = tc
@@ -185,17 +240,17 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 		a.conversation = append(a.conversation, Message{Role: "assistant", Content: response, ToolCalls: normalizedToolCalls})
 		a.mu.Unlock()
 
-		// If zero tool calls, the model decided it was done or wants to talk
 		if len(toolCalls) == 0 {
 			a.mu.Lock()
-			a.reflectionAttempts = make(map[string]int) // Reset on exit
+			a.reflectionAttempts = make(map[string]int)
 			a.mu.Unlock()
 
+			a.emitWithMeta(EventComplete, "Task completed successfully", nil)
 			break
 		}
-		// ... Parsing error logic handled inside getLLMResponseStream ...
 
-		// Execute tools concurrently
+		a.emitWithMeta(EventPlanning, fmt.Sprintf("Executing %d tool(s): %s", len(toolCalls), formatToolNames(toolCalls)), nil)
+
 		var wg sync.WaitGroup
 		var toolMu sync.Mutex
 
@@ -207,14 +262,17 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 				tool, ok := a.registry.Get(toolCall.Function.Name)
 				if !ok {
 					errMsg := fmt.Sprintf("unknown tool: %s", toolCall.Function.Name)
+					a.emitWithMeta(EventToolError, fmt.Sprintf("Tool '%s' not found", toolCall.Function.Name), ToolCallMeta{ToolName: toolCall.Function.Name})
+
 					a.mu.Lock()
 					errorKey := fmt.Sprintf("%s:%v", toolCall.Function.Name, errMsg)
 					attempts := a.reflectionAttempts[errorKey]
 
-					if attempts < 3 { // Retry loop logic
+					if attempts < 3 {
 						reflectionMsg := fmt.Sprintf("Tool '%s' failed: %s. Call a different tool.", toolCall.Function.Name, errMsg)
 						a.conversation = append(a.conversation, Message{Role: "system", Content: reflectionMsg})
 						a.reflectionAttempts[errorKey] = attempts + 1
+						a.emitWithMeta(EventRetry, fmt.Sprintf("Retrying with alternative tool (attempt %d/3)", attempts+1), RetryMeta{ToolName: toolCall.Function.Name, Attempt: attempts + 1, MaxAttempts: 3, Error: errMsg})
 					}
 					a.mu.Unlock()
 
@@ -226,11 +284,11 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 					return
 				}
 
-				// Execute tool
 				args, _ := toolCall.Function.ParseArguments()
+				a.emitWithMeta(EventToolCall, fmt.Sprintf("Calling %s...", toolCall.Function.Name), ToolCallMeta{ToolName: toolCall.Function.Name, Args: args})
+
 				result, err := tool.Execute(ctx, args)
 
-				// Handle Error
 				if err != nil {
 					a.mu.Lock()
 					errorKey := fmt.Sprintf("%s:%v", toolCall.Function.Name, err)
@@ -243,6 +301,8 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 					}
 					a.mu.Unlock()
 
+					a.emitWithMeta(EventToolError, fmt.Sprintf("Tool '%s' failed: %v (attempt %d/3)", toolCall.Function.Name, err, attempts+1), RetryMeta{ToolName: toolCall.Function.Name, Attempt: attempts + 1, MaxAttempts: 3, Error: err.Error()})
+
 					toolMu.Lock()
 					msg := fmt.Sprintf("\n⚠️ Tool '%s' failed: %v (attempt %d/3)\n", toolCall.Function.Name, err, attempts+1)
 					finalOutput.WriteString(msg)
@@ -251,10 +311,8 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 					return
 				}
 
-				// Handle Success
 				toolMu.Lock()
 
-				// Generate dynamic context-aware message based on the tool executed
 				var dynamicMsg string
 				switch toolCall.Function.Name {
 				case "list_directory":
@@ -277,6 +335,8 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 					dynamicMsg = fmt.Sprintf("Executed tool: %s", toolCall.Function.Name)
 				}
 
+				a.emitWithMeta(EventToolResult, dynamicMsg, ToolCallMeta{ToolName: toolCall.Function.Name, Args: args})
+
 				msg := fmt.Sprintf("\n✅ %s\n", dynamicMsg)
 				finalOutput.WriteString(msg)
 				a.stream(msg)
@@ -286,7 +346,7 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 				a.conversation = append(a.conversation,
 					Message{Role: "tool", Content: result, ToolCallID: toolCall.ID, ToolName: toolCall.Function.Name},
 				)
-				a.reflectionAttempts = make(map[string]int) // Reset on success
+				a.reflectionAttempts = make(map[string]int)
 				a.mu.Unlock()
 
 			}(tc)
@@ -294,27 +354,32 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 
 		wg.Wait()
 
-		// Let the loop continue to the next iteration so the LLM can analyze the tool results
+		a.emitWithMeta(EventThinking, "Analyzing tool results...", nil)
 		continue
 	}
 
 	return finalOutput.String(), nil
 }
 
-// getLLMResponseStream sends the conversation to LLM and processes the streamed response.
+func formatToolNames(toolCalls []llm.ToolCall) string {
+	names := make([]string, len(toolCalls))
+	for i, tc := range toolCalls {
+		names[i] = tc.Function.Name
+	}
+	return strings.Join(names, ", ")
+}
+
 func (a *Agent) getLLMResponseStream(ctx context.Context, finalOutput *strings.Builder, callback StreamCallback) (string, []llm.ToolCall, error) {
 	a.mu.RLock()
 	conversation := make([]Message, len(a.conversation))
 	copy(conversation, a.conversation)
 	a.mu.RUnlock()
 
-	// Context window management
 	maxChars := a.contextWindow * 4
 	totalChars := 0
 	for _, msg := range conversation {
 		totalChars += len(msg.Content)
 	}
-	// Drop 2 older messages at a time (pair of user/assistant) to preserve alternating conversational state
 	for totalChars > maxChars && len(conversation) > 3 {
 		droppedMsg1 := conversation[1]
 		droppedMsg2 := conversation[2]
@@ -335,7 +400,7 @@ func (a *Agent) getLLMResponseStream(ctx context.Context, finalOutput *strings.B
 
 	nativeTools := a.getNativeTools()
 
-	resultChan := make(chan *llm.ChatResponse, 100) // Buffer stream
+	resultChan := make(chan *llm.ChatResponse, 100)
 	errChan := make(chan error, 1)
 
 	a.llmClient.SetTools(nativeTools)
@@ -360,7 +425,6 @@ func (a *Agent) getLLMResponseStream(ctx context.Context, finalOutput *strings.B
 
 			finalChunk = resp
 
-			// Get content from response
 			newContent := ""
 			newThinking := ""
 			if resp.Message.Content != "" {
@@ -391,7 +455,6 @@ func (a *Agent) getLLMResponseStream(ctx context.Context, finalOutput *strings.B
 	}
 }
 
-// GetConversation returns a copy of the current conversation history.
 func (a *Agent) GetConversation() []Message {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -400,7 +463,6 @@ func (a *Agent) GetConversation() []Message {
 	return result
 }
 
-// Reset clears the conversation state.
 func (a *Agent) Reset() {
 	a.mu.Lock()
 	a.conversation = nil
@@ -408,12 +470,10 @@ func (a *Agent) Reset() {
 	a.mu.Unlock()
 }
 
-// GetLLMClient returns the underlying LLM client.
 func (a *Agent) GetLLMClient() *llm.Client {
 	return a.llmClient
 }
 
-// SaveHistory saves the current conversation to a JSON file.
 func (a *Agent) SaveHistory(filepath string) error {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -425,12 +485,11 @@ func (a *Agent) SaveHistory(filepath string) error {
 	return os.WriteFile(filepath, data, 0644)
 }
 
-// LoadHistory loads the conversation from a JSON file.
 func (a *Agent) LoadHistory(filepath string) error {
 	data, err := os.ReadFile(filepath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil // OK if file doesn't exist yet
+			return nil
 		}
 		return err
 	}
