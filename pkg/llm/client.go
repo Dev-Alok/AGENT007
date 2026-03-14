@@ -220,31 +220,22 @@ func (c *Client) Chat(ctx context.Context, model string, messages []Message, use
 }
 
 func (c *Client) chatLMStudio(ctx context.Context, client *http.Client, model string, messages []Message, useJSONMode bool) (*ChatResponse, error) {
-	req := LMStudioChatRequest{
-		Model:    model,
-		Messages: messages,
-		Tools:    c.tools,
-		Stream:   false,
-		Options: map[string]interface{}{
-			"temperature":    c.temperature,
-			"num_predict":    c.numPredict,
-			"top_k":          c.topK,
-			"top_p":          c.topP,
-			"repeat_penalty": c.repeatPenalty,
-			"seed":           c.seed,
-		},
-	}
+	return c.sendRequest(ctx, client, model, messages, useJSONMode, "/v1/chat/completions")
+}
 
-	if useJSONMode {
-		req.Format = "json"
-	}
+func (c *Client) chatOllama(ctx context.Context, client *http.Client, model string, messages []Message, useJSONMode bool) (*ChatResponse, error) {
+	return c.sendRequest(ctx, client, model, messages, useJSONMode, "/api/chat")
+}
+
+func (c *Client) sendRequest(ctx context.Context, client *http.Client, model string, messages []Message, useJSONMode bool, endpointPath string) (*ChatResponse, error) {
+	req := c.buildChatRequest(model, messages, useJSONMode)
 
 	jsonData, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/v1/chat/completions", strings.NewReader(string(jsonData)))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+endpointPath, strings.NewReader(string(jsonData)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
 	}
@@ -277,7 +268,28 @@ func (c *Client) chatLMStudio(ctx context.Context, client *http.Client, model st
 	return &chatResp, nil
 }
 
-func (c *Client) chatOllama(ctx context.Context, client *http.Client, model string, messages []Message, useJSONMode bool) (*ChatResponse, error) {
+func (c *Client) buildChatRequest(model string, messages []Message, useJSONMode bool) interface{} {
+	if c.provider == ProviderLMStudio {
+		req := LMStudioChatRequest{
+			Model:    model,
+			Messages: messages,
+			Tools:    c.tools,
+			Stream:   false,
+			Options: map[string]interface{}{
+				"temperature":    c.temperature,
+				"num_predict":    c.numPredict,
+				"top_k":          c.topK,
+				"top_p":          c.topP,
+				"repeat_penalty": c.repeatPenalty,
+				"seed":           c.seed,
+			},
+		}
+		if useJSONMode {
+			req.Format = "json"
+		}
+		return req
+	}
+
 	req := ChatRequest{
 		Model:    model,
 		Messages: messages,
@@ -292,47 +304,10 @@ func (c *Client) chatOllama(ctx context.Context, client *http.Client, model stri
 			"seed":           c.seed,
 		},
 	}
-
 	if useJSONMode {
 		req.Format = "json"
 	}
-
-	jsonData, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/chat", strings.NewReader(string(jsonData)))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
-
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("HTTP request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
-	}
-
-	var chatResp ChatResponse
-	if err := json.Unmarshal(body, &chatResp); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
-	}
-
-	return &chatResp, nil
+	return req
 }
 
 func (c *Client) StreamChat(ctx context.Context, model string, messages []Message, useJSONMode bool, resultChan chan<- *ChatResponse, errChan chan<- error) {

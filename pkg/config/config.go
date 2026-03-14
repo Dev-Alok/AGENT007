@@ -61,9 +61,26 @@ func LoadConfig(filePath string) (*AgentConfig, error) {
 		return nil, fmt.Errorf("failed to parse configuration file JSON: %w", err)
 	}
 
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("configuration validation failed: %w", err)
+	}
+
 	cfg.LLMEndpoint = normalizeEndpoint(cfg.LLMEndpoint, cfg.Provider)
 
 	return cfg, nil
+}
+
+func (c *AgentConfig) Validate() error {
+	if c.ContextWindow <= 0 {
+		return fmt.Errorf("context_window must be positive")
+	}
+	if c.Temperature < 0 || c.Temperature > 2 {
+		return fmt.Errorf("temperature must be between 0 and 2")
+	}
+	if c.LLMTimeoutSeconds <= 0 {
+		return fmt.Errorf("llm_timeout_seconds must be positive")
+	}
+	return nil
 }
 
 func normalizeEndpoint(endpoint string, provider ProviderType) string {

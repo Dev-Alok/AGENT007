@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -9,6 +10,12 @@ import (
 	"agentic-coder/pkg/orchestrator"
 	"agentic-coder/pkg/tools"
 	"agentic-coder/tui"
+)
+
+const (
+	colorReset  = "\033[0m"
+	colorGreen  = "\033[32m"
+	colorYellow = "\033[33m"
 )
 
 func main() {
@@ -43,11 +50,11 @@ func main() {
 		fmt.Printf("Note: Could not load previous history: %v\n", err)
 	}
 
-	if err := agent.GetLLMClient().HealthCheck(nil); err != nil {
-		fmt.Printf("Warning: Could not connect to %s at %s: %v\n", cfg.Provider, cfg.LLMEndpoint, err)
+	if err := agent.GetLLMClient().HealthCheck(context.Background()); err != nil {
+		fmt.Printf("%sWarning: Could not connect to %s at %s: %v%s\n", colorYellow, cfg.Provider, cfg.LLMEndpoint, err, colorReset)
 		fmt.Println("Attempting to continue anyway...")
 	} else {
-		fmt.Printf("✓ Connection to %s validated successfully.\n", cfg.Provider)
+		fmt.Printf("%s✓ Connection to %s validated successfully.%s\n", colorGreen, cfg.Provider, colorReset)
 	}
 
 	t := tui.NewTUI(agent, cfg)
