@@ -26,17 +26,15 @@ type Agent struct {
 	conversation []Message
 
 	reflectionAttempts map[string]int
-	currentThinking    string
-	currentContent     string
 }
 
 // Message represents a chat message in the conversation history.
 type Message struct {
-	Role      string         `json:"role"`
-	Content   string         `json:"content"`
-	Thinking  string         `json:"thinking,omitempty"`
-	ToolCalls []llm.ToolCall `json:"tool_calls,omitempty"`
-	ToolName  string         `json:"tool_name,omitempty"`
+	Role        string         `json:"role"`
+	Content     string         `json:"content"`
+	ToolCalls   []llm.ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID  string         `json:"tool_call_id,omitempty"`
+	ToolName    string         `json:"tool_name,omitempty"`
 }
 
 // NewAgent creates a new agent with the specified tool registry and configuration.
@@ -61,26 +59,6 @@ func NewAgentWithTimeout(registry *tools.Registry, cfg *config.AgentConfig, time
 		maxIterations:      5,
 		reflectionAttempts: make(map[string]int),
 	}
-}
-
-// SetOutputCallback sets a callback function for streaming output (thinking, content).
-func (a *Agent) SetOutputCallback(callback func(string, string)) {
-	// Deprecated: keeping for compatibility
-}
-
-// GetCurrentOutput returns the current thinking and content
-func (a *Agent) GetCurrentOutput() (string, string) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	return a.currentThinking, a.currentContent
-}
-
-// SetCurrentOutput sets the current thinking and content
-func (a *Agent) SetCurrentOutput(thinking, content string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.currentThinking = thinking
-	a.currentContent = content
 }
 
 // SetModel allows changing the LLM model at runtime.
@@ -122,10 +100,11 @@ func (a *Agent) getNativeTools() []llm.Tool {
 
 // Execute runs the agent's main loop for a given task.
 // Returns when task is complete or context is cancelled.
+// Each execution starts fresh with no conversation history.
 func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 	nativeTools := a.getNativeTools()
 
-	// Initialize conversation with system prompt and user task
+	// Initialize conversation with system prompt and user task (fresh each time)
 	systemPrompt := llm.BuildSystemPrompt(nativeTools)
 
 	// Add working directory context
@@ -135,17 +114,10 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 	}
 
 	a.mu.Lock()
-	if len(a.conversation) == 0 {
-		a.conversation = []Message{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: task},
-		}
-	} else {
-		// Update system prompt to maintain current working directory info
-		if len(a.conversation) > 0 && a.conversation[0].Role == "system" {
-			a.conversation[0].Content = systemPrompt
-		}
-		a.conversation = append(a.conversation, Message{Role: "user", Content: task})
+	// Always start fresh - no conversation history
+	a.conversation = []Message{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: task},
 	}
 	a.mu.Unlock()
 
@@ -167,9 +139,17 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 			return finalOutput.String(), fmt.Errorf("LLM error at iteration %d: %w", iteration, err)
 		}
 
-		// Append the assistant's unified response once before checking success states
+	// Append the assistant's unified response once before checking success states
+		// Convert tool calls to have proper map arguments for serialization
+		normalizedToolCalls := make([]llm.ToolCall, len(toolCalls))
+		for i, tc := range toolCalls {
+			normalizedToolCalls[i] = tc
+			if args, err := tc.Function.ParseArguments(); err == nil && args != nil {
+				normalizedToolCalls[i].Function.Arguments = args
+			}
+		}
 		a.mu.Lock()
-		a.conversation = append(a.conversation, Message{Role: "assistant", Content: response, ToolCalls: toolCalls})
+		a.conversation = append(a.conversation, Message{Role: "assistant", Content: response, ToolCalls: normalizedToolCalls})
 		a.mu.Unlock()
 
 		// If zero tool calls, the model decided it was done or wants to talk
@@ -178,9 +158,6 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 			a.reflectionAttempts = make(map[string]int) // Reset on exit
 			a.mu.Unlock()
 
-			msg := "\n✨ Task Complete ✨\n"
-			fmt.Print(msg)
-			finalOutput.WriteString(msg)
 			break
 		}
 		// ... Parsing error logic handled inside getLLMResponseStream ...
@@ -210,14 +187,15 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 
 					toolMu.Lock()
 					msg := fmt.Sprintf("\n⚠️ Tool '%s' failed: %v\n", toolCall.Function.Name, errMsg)
-					fmt.Print(msg)
+					fmt.Fprint(os.Stdout, msg)
 					finalOutput.WriteString(msg)
 					toolMu.Unlock()
 					return
 				}
 
-				// Execute tool
-				result, err := tool.Execute(ctx, toolCall.Function.Arguments)
+			// Execute tool
+			args, _ := toolCall.Function.ParseArguments()
+			result, err := tool.Execute(ctx, args)
 
 				// Handle Error
 				if err != nil {
@@ -232,48 +210,48 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 					}
 					a.mu.Unlock()
 
-					toolMu.Lock()
-					msg := fmt.Sprintf("\n⚠️ Tool '%s' failed: %v (attempt %d/3)\n", toolCall.Function.Name, err, attempts+1)
-					fmt.Print(msg)
-					finalOutput.WriteString(msg)
-					toolMu.Unlock()
-					return
-				}
+				toolMu.Lock()
+				msg := fmt.Sprintf("\n⚠️ Tool '%s' failed: %v (attempt %d/3)\n", toolCall.Function.Name, err, attempts+1)
+				fmt.Fprint(os.Stdout, msg)
+				finalOutput.WriteString(msg)
+				toolMu.Unlock()
+				return
+			}
 
 				// Handle Success
 				toolMu.Lock()
 
-				// Generate dynamic context-aware message based on the tool executed
+			// Generate dynamic context-aware message based on the tool executed
 				var dynamicMsg string
 				switch toolCall.Function.Name {
 				case "list_directory":
-					dynamicMsg = fmt.Sprintf("Listed directory: %v", toolCall.Function.Arguments["path"])
+					dynamicMsg = fmt.Sprintf("Listed directory: %v", args["path"])
 				case "read_file":
-					dynamicMsg = fmt.Sprintf("Read file: %v", toolCall.Function.Arguments["path"])
+					dynamicMsg = fmt.Sprintf("Read file: %v", args["path"])
 				case "search_file":
-					dynamicMsg = fmt.Sprintf("Searched for file: %v", toolCall.Function.Arguments["name"])
+					dynamicMsg = fmt.Sprintf("Searched for file: %v", args["name"])
 				case "grep_search":
-					dynamicMsg = fmt.Sprintf("Grep searched for \"%v\" in %v", toolCall.Function.Arguments["query"], toolCall.Function.Arguments["path"])
+					dynamicMsg = fmt.Sprintf("Grep searched for \"%v\" in %v", args["query"], args["path"])
 				case "write_file":
-					dynamicMsg = fmt.Sprintf("Wrote to file: %v", toolCall.Function.Arguments["path"])
+					dynamicMsg = fmt.Sprintf("Wrote to file: %v", args["path"])
 				case "replace_file_content":
-					dynamicMsg = fmt.Sprintf("Replaced content in file: %v", toolCall.Function.Arguments["path"])
+					dynamicMsg = fmt.Sprintf("Replaced content in file: %v", args["path"])
 				case "read_url":
-					dynamicMsg = fmt.Sprintf("Fetched URL: %v", toolCall.Function.Arguments["url"])
+					dynamicMsg = fmt.Sprintf("Fetched URL: %v", args["url"])
 				case "run_command":
-					dynamicMsg = fmt.Sprintf("Ran command: %v", toolCall.Function.Arguments["command"])
+					dynamicMsg = fmt.Sprintf("Ran command: %v", args["command"])
 				default:
 					dynamicMsg = fmt.Sprintf("Executed tool: %s", toolCall.Function.Name)
 				}
 
-				msg := fmt.Sprintf("\n✅ \033[32m%s\033[0m\n", dynamicMsg)
-				fmt.Print(msg)
+			msg := fmt.Sprintf("\n✅ \033[32m%s\033[0m\n", dynamicMsg)
+				fmt.Fprint(os.Stdout, msg)
 				finalOutput.WriteString(msg)
 				toolMu.Unlock()
 
-				a.mu.Lock()
+			a.mu.Lock()
 				a.conversation = append(a.conversation,
-					Message{Role: "tool", Content: result, ToolName: toolCall.Function.Name},
+					Message{Role: "tool", Content: result, ToolCallID: toolCall.ID, ToolName: toolCall.Function.Name},
 				)
 				a.reflectionAttempts = make(map[string]int) // Reset on success
 				a.mu.Unlock()
@@ -313,7 +291,13 @@ func (a *Agent) getLLMResponseStream(ctx context.Context, finalOutput *strings.B
 
 	llmMessages := make([]llm.Message, len(conversation))
 	for i, msg := range conversation {
-		llmMessages[i] = llm.Message{Role: msg.Role, Content: msg.Content, ToolCalls: msg.ToolCalls, ToolName: msg.ToolName}
+		llmMessages[i] = llm.Message{
+			Role:       msg.Role,
+			Content:    msg.Content,
+			ToolCalls:  msg.ToolCalls,
+			ToolCallID: msg.ToolCallID,
+			ToolName:   msg.ToolName,
+		}
 	}
 
 	nativeTools := a.getNativeTools()
@@ -325,10 +309,7 @@ func (a *Agent) getLLMResponseStream(ctx context.Context, finalOutput *strings.B
 	go a.llmClient.StreamChat(ctx, a.model, llmMessages, false, resultChan, errChan)
 
 	var fullResponse strings.Builder
-	var fullThinking strings.Builder
 	var finalChunk *llm.ChatResponse
-	formattedThinking := false
-	var hasContent bool
 
 	for {
 		select {
@@ -346,39 +327,20 @@ func (a *Agent) getLLMResponseStream(ctx context.Context, finalOutput *strings.B
 
 			finalChunk = resp
 
-			// Get content from response - check both reasoning_content and content
-			newContent := ""
-			newThinking := ""
-			
-			if resp.Message.Content != "" {
-				newContent = strings.TrimPrefix(resp.Message.Content, fullResponse.String())
-				hasContent = true
-			} else if resp.Message.ReasoningContent != "" {
-				newThinking = strings.TrimPrefix(resp.Message.ReasoningContent, fullThinking.String())
-			}
+		// Get content from response
+		newContent := ""
+		if resp.Message.Content != "" {
+			newContent = strings.TrimPrefix(resp.Message.Content, fullResponse.String())
+		}
 
-			if newThinking != "" {
-				fullThinking.WriteString(newThinking)
-			}
-			if newContent != "" {
-				fullResponse.WriteString(newContent)
-			}
+		if newContent != "" {
+			fullResponse.WriteString(newContent)
 			finalOutput.WriteString(newContent)
+		}
 
-			// Call callback with both thinking and content
-			a.mu.Lock()
-			a.currentThinking = fullThinking.String()
-			a.currentContent = fullResponse.String()
-			a.mu.Unlock()
-
-			if !formattedThinking && !hasContent && fullThinking.Len() > 0 {
-				fmt.Print("\n\033[35m🤔 Thinking...\033[0m\n")
-				formattedThinking = true
-			}
-
-			// Print with immediate flush
+		// Stream content as it comes
 			if newContent != "" {
-				fmt.Print(newContent)
+				fmt.Fprint(os.Stdout, newContent)
 			}
 		case <-ctx.Done():
 			return fullResponse.String(), nil, ctx.Err()

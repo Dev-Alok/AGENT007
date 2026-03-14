@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
 	"agentic-coder/pkg/config"
 	"agentic-coder/pkg/orchestrator"
@@ -29,16 +28,6 @@ type TUI struct {
 	agent   *orchestrator.Agent
 	cfg     *config.AgentConfig
 	done    chan struct{}
-}
-
-type Message struct {
-	Role      string
-	Content   string
-	Thinking  string
-	Time      time.Time
-	ToolName  string
-	ToolArgs  string
-	ToolResult string
 }
 
 func NewTUI(agent *orchestrator.Agent, cfg *config.AgentConfig) *TUI {
@@ -88,11 +77,7 @@ func (t *TUI) handleInput(input string) {
 }
 
 func (t *TUI) executeTask(task string) {
-	// Clear previous thinking
-	t.agent.SetCurrentOutput("", "")
-	
 	fmt.Println()
-	fmt.Printf("%s%s◌ Thinking...%s\n", Dim, Yellow, Reset)
 
 	ctx := context.Background()
 	_, err := t.agent.Execute(ctx, task)
@@ -100,73 +85,82 @@ func (t *TUI) executeTask(task string) {
 	// Get the thinking and content from agent
 	thinking, content := t.agent.GetCurrentOutput()
 	
-	// Display thinking if exists
-	if thinking != "" {
-		t.displayThinking(thinking)
+	// Display thinking if exists and is different from content
+	if thinking != "" && thinking != content {
+		t.displayBlock("🤔 Thinking", thinking, Purple)
+		fmt.Println()
 	}
 	
-	// Display content
+	// Display content if exists
 	if content != "" {
-		t.displayMessage("assistant", content)
-	} else if thinking == "" && content == "" {
-		// Task completed without content (like a simple acknowledgment)
-		fmt.Printf("\n%s%s✓ Done%s\n", Bold, Green, Reset)
+		t.displayBlock("🤖 Assistant", content, Cyan)
 	}
 	
 	if err != nil {
-		t.displayMessage("error", err.Error())
+		t.displayBlock("✗ Error", err.Error(), Red)
 	}
 }
 
-func (t *TUI) displayThinking(thinking string) {
-	fmt.Printf("\n%s%s┌─ %s🤔 Thinking%s\n", Bold, Grey, Purple, Grey)
-	lines := wrapText(thinking, 65)
-	for _, line := range lines {
-		fmt.Printf("%s%s│%s %s%s\n", Bold, Grey, Reset, Dim, line)
-	}
-	fmt.Printf("%s%s└%s\n", Bold, Grey, Reset)
-}
-
-func (t *TUI) displayMessage(role, content string) {
-	var icon, iconColor, borderColor string
+func (t *TUI) displayBlock(title, content string, titleColor string) {
+	borderColor := Grey
 	
-	switch role {
-	case "user":
-		icon, iconColor, borderColor = "👤", Green, Grey
-	case "assistant":
-		icon, iconColor, borderColor = "🤖", Cyan, Grey
-	case "tool":
-		icon, iconColor, borderColor = "🔧", Yellow, Grey
-	case "error":
-		icon, iconColor, borderColor = "✗", Red, Grey
-	default:
-		icon, iconColor, borderColor = "●", Cyan, Grey
+	// First check if content was already printed (starts with common prefixes)
+	if strings.HasPrefix(content, "\n\033[36m🤖 Assistant:\033[0m\n") {
+		// Content was already printed by orchestrator, just show thinking part
+		content = strings.TrimPrefix(content, "\n\033[36m🤖 Assistant:\033[0m\n")
 	}
 	
-	if role == "error" {
-		fmt.Printf("\n%s%s┌─ %sError%s\n", Bold, borderColor, iconColor, Grey)
-	} else {
-		fmt.Printf("\n%s%s┌─ %s%s %s%s\n", Bold, borderColor, iconColor, icon, Grey)
-	}
+	// Remove any existing ANSI escape sequences for cleaner display
+	// This is a simplified approach - we just display what we have
 	
-	lines := wrapText(content, 65)
+	lines := wrapText(content, 62)
+	
+	// Draw top border
+	fmt.Printf("%s┌", borderColor)
+	for i := 0; i < 66; i++ {
+		fmt.Printf("─")
+	}
+	fmt.Printf("┐%s\n", Reset)
+	
+	// Title
+	fmt.Printf("%s│%s %s %s%s\n", borderColor, Reset, titleColor, title, Reset)
+	
+	// Separator
+	fmt.Printf("%s│", borderColor)
+	for i := 0; i < 66; i++ {
+		fmt.Printf("─")
+	}
+	fmt.Printf("│%s\n", Reset)
+	
+	// Content
 	for i, line := range lines {
-		if i == 0 {
-			fmt.Printf("%s%s│%s %s\n", Bold, borderColor, Reset, line)
+		padding := 66 - len(line)
+		if i == len(lines)-1 {
+			// Last line - use └┘
+			fmt.Printf("%s│%s %s%s%s%s└%s\n", borderColor, Reset, line, strings.Repeat(" ", padding), borderColor, Reset)
 		} else {
-			fmt.Printf("%s%s │%s %s\n", Bold, borderColor, Reset, line)
+			fmt.Printf("%s│%s %s%s%s│%s\n", borderColor, Reset, line, strings.Repeat(" ", padding), borderColor, Reset)
 		}
 	}
-	fmt.Printf("%s%s└%s\n", Bold, borderColor, Reset)
+	
+	// Bottom border
+	fmt.Printf("%s└", borderColor)
+	for i := 0; i < 66; i++ {
+		fmt.Printf("─")
+	}
+	fmt.Printf("┘%s", Reset)
 }
 
 func wrapText(text string, width int) []string {
-	if len(text) <= width {
-		return []string{text}
+	// First clean the text of ANSI codes for proper wrapping
+	clean := stripANSI(text)
+	
+	if len(clean) <= width {
+		return []string{clean}
 	}
 	
 	var lines []string
-	words := strings.Fields(text)
+	words := strings.Fields(clean)
 	currentLine := ""
 	
 	for _, word := range words {
@@ -189,18 +183,31 @@ func wrapText(text string, width int) []string {
 	return lines
 }
 
+func stripANSI(s string) string {
+	result := strings.Builder{}
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\033' {
+			// Skip until we find the letter at the end of escape sequence
+			for i < len(s) && s[i] != 'm' {
+				i++
+			}
+			continue
+		}
+		result.WriteByte(s[i])
+	}
+	return result.String()
+}
+
 func (t *TUI) showHelp() {
-	fmt.Printf("\n%s%s┌─ %s📖 Help%s\n", Bold, Grey, Yellow, Grey)
-	fmt.Printf("%s%s│%s\n", Bold, Grey, Reset)
-	fmt.Printf("%s%s│%s   %s/help%s      - Show this help\n", Bold, Grey, Reset, Green, Reset)
-	fmt.Printf("%s%s│%s   %s/clear%s    - Clear screen\n", Bold, Grey, Reset, Green, Reset)
-	fmt.Printf("%s%s│%s   %s/config%s    - Show configuration\n", Bold, Grey, Reset, Green, Reset)
-	fmt.Printf("%s%s│%s   %s/exit%s      - Exit\n", Bold, Grey, Reset, Green, Reset)
-	fmt.Printf("%s%s│%s   %s/q%s         - Exit (shortcut)\n", Bold, Grey, Reset, Green, Reset)
-	fmt.Printf("%s%s│%s\n", Bold, Grey, Reset)
-	fmt.Printf("%s%s│%s   Type your request and press Enter\n", Bold, Grey, Reset)
-	fmt.Printf("%s%s│%s   The agent will use tools automatically\n", Bold, Grey, Reset)
-	fmt.Printf("%s%s└%s\n", Bold, Grey, Reset)
+	t.displayBlock("📖 Help", `Commands:
+  /help      - Show this help
+  /clear     - Clear screen  
+  /config    - Show configuration
+  /exit      - Exit
+  q          - Exit (shortcut)
+
+Type your request and press Enter.
+The agent will use tools automatically.`, Yellow)
 }
 
 func (t *TUI) clearScreen() {
@@ -208,16 +215,16 @@ func (t *TUI) clearScreen() {
 }
 
 func (t *TUI) showConfig() {
-	fmt.Printf("\n%s%s┌─ %s⚙️ Configuration%s\n", Bold, Grey, Yellow, Grey)
-	fmt.Printf("%s%s│%s\n", Bold, Grey, Reset)
-	fmt.Printf("%s%s│%s   %sProvider:%s   %s%s\n", Bold, Grey, Reset, Dim, Reset, Cyan, t.cfg.Provider)
-	fmt.Printf("%s%s│%s   %sModel:%s      %s%s\n", Bold, Grey, Reset, Dim, Reset, Cyan, t.cfg.Model)
-	fmt.Printf("%s%s│%s   %sEndpoint:%s   %s%s\n", Bold, Grey, Reset, Dim, Reset, Cyan, t.cfg.LLMEndpoint)
-	fmt.Printf("%s%s│%s   %sContext:%s    %s%d tokens\n", Bold, Grey, Reset, Dim, Reset, Cyan, t.cfg.ContextWindow)
-	fmt.Printf("%s%s│%s   %sTemperature:%s %.2f\n", Bold, Grey, Reset, Dim, Reset, Cyan, t.cfg.Temperature)
-	fmt.Printf("%s%s│%s   %sTimeout:%s     %ds\n", Bold, Grey, Reset, Dim, Reset, Cyan, t.cfg.LLMTimeoutSeconds)
-	fmt.Printf("%s%s│%s\n", Bold, Grey, Reset)
-	fmt.Printf("%s%s└%s\n", Bold, Grey, Reset)
+	info := fmt.Sprintf(`Provider:    %s
+Model:       %s
+Endpoint:    %s
+Context:     %d tokens
+Temperature: %.2f
+Timeout:     %d seconds`, 
+		t.cfg.Provider, t.cfg.Model, t.cfg.LLMEndpoint, 
+		t.cfg.ContextWindow, t.cfg.Temperature, t.cfg.LLMTimeoutSeconds)
+	
+	t.displayBlock("⚙️ Configuration", info, Yellow)
 }
 
 func (t *TUI) renderHeader() {

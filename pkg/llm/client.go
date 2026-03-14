@@ -80,6 +80,7 @@ type Message struct {
 	Content          string     `json:"content"`
 	ReasoningContent string     `json:"reasoning_content,omitempty"`
 	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string     `json:"tool_call_id,omitempty"`
 	ToolName         string     `json:"tool_name,omitempty"`
 }
 
@@ -90,6 +91,7 @@ type ChatResponse struct {
 	Choices   []Choice  `json:"choices"`
 	Done      bool      `json:"done"`
 	Usage     Usage     `json:"usage,omitempty"`
+	Thinking  string    `json:"-"` // Store thinking separately for internal use
 }
 
 type Choice struct {
@@ -106,12 +108,55 @@ type Usage struct {
 }
 
 type ToolCall struct {
-	Function ToolCallFunction `json:"function"`
+	Index    int                 `json:"index"`
+	ID       string              `json:"id"`
+	Type     string              `json:"type"`
+	Function ToolCallFunction   `json:"function"`
 }
 
 type ToolCallFunction struct {
-	Name      string                 `json:"name"`
-	Arguments map[string]interface{} `json:"arguments"`
+	Name      string                  `json:"name,omitempty"`
+	Arguments map[string]interface{}  `json:"-"`
+	RawArgs   string                  `json:"arguments,omitempty"`
+}
+
+func (tcf *ToolCallFunction) UnmarshalJSON(data []byte) error {
+	type Alias ToolCallFunction
+	aux := &struct {
+		Arguments json.RawMessage `json:"arguments"`
+		*Alias
+	}{
+		Alias: (*Alias)(tcf),
+	}
+	
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	
+	// Handle arguments - can be string or object
+	if len(aux.Arguments) > 0 {
+		// Try to unmarshal as object first
+		if err := json.Unmarshal(aux.Arguments, &tcf.Arguments); err != nil {
+			// If that fails, treat as string
+			tcf.RawArgs = string(aux.Arguments)
+		}
+	}
+	
+	return nil
+}
+
+func (tcf *ToolCallFunction) ParseArguments() (map[string]interface{}, error) {
+	if tcf.Arguments != nil && len(tcf.Arguments) > 0 {
+		return tcf.Arguments, nil
+	}
+	if tcf.RawArgs == "" {
+		return nil, nil
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal([]byte(tcf.RawArgs), &result); err != nil {
+		return nil, fmt.Errorf("failed to parse arguments: %w", err)
+	}
+	return result, nil
 }
 
 func NewClient(baseURL, apiKey string, provider ProviderType, temperature float32, numPredict, topK int, topP, repeatPenalty float32, seed int) *Client {
@@ -361,6 +406,8 @@ func (c *Client) streamLMStudio(ctx context.Context, client *http.Client, model 
 		return
 	}
 
+	log.Printf("DEBUG: Sending request messages: %s", string(jsonData))
+
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/v1/chat/completions", strings.NewReader(string(jsonData)))
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create HTTP request: %w", err)
@@ -387,6 +434,8 @@ func (c *Client) streamLMStudio(ctx context.Context, client *http.Client, model 
 
 	scanner := bufio.NewScanner(resp.Body)
 	var fullResponse strings.Builder
+	var fullThinking strings.Builder
+	accumulatedToolCalls := make(map[string]*ToolCall) // Use ID as key
 
 	for scanner.Scan() {
 		select {
@@ -412,71 +461,91 @@ func (c *Client) streamLMStudio(ctx context.Context, client *http.Client, model 
 			lineStr = lineStr[6:]
 		}
 
-		var chunk ChatResponse
-		if err := json.Unmarshal([]byte(lineStr), &chunk); err != nil {
+		// Parse using raw JSON to handle streaming tool calls properly
+		var raw map[string]interface{}
+		if err := json.Unmarshal([]byte(lineStr), &raw); err != nil {
 			log.Printf("Warning: failed to parse stream chunk: %v", err)
 			continue
 		}
 
 		// Extract content from choices[0].delta
 		var content string
-		if len(chunk.Choices) > 0 {
-			delta := chunk.Choices[0].Delta
-			// First check reasoning_content (thinking), then content
-			if delta.Content != "" {
-				content = delta.Content
-			}
-			// reasoning_content should also be included
-			if delta.ToolName != "" {
-				// This is reasoning content
-			}
-		}
-
-		// Handle reasoning_content field in delta
-		if content == "" {
-			// Try to parse the raw JSON for reasoning_content
-			var raw map[string]interface{}
-			if err := json.Unmarshal([]byte(lineStr), &raw); err == nil {
-				if choices, ok := raw["choices"].([]interface{}); ok && len(choices) > 0 {
-					if choice, ok := choices[0].(map[string]interface{}); ok {
-						if delta, ok := choice["delta"].(map[string]interface{}); ok {
-							if rc, ok := delta["reasoning_content"].(string); ok && rc != "" {
-								content = rc
-							}
-						}
+		var reasoningContent string
+		
+		if choices, ok := raw["choices"].([]interface{}); ok && len(choices) > 0 {
+			if choice, ok := choices[0].(map[string]interface{}); ok {
+				if delta, ok := choice["delta"].(map[string]interface{}); ok {
+					if rc, ok := delta["reasoning_content"].(string); ok && rc != "" {
+						reasoningContent = rc
+					}
+					if c, ok := delta["content"].(string); ok && c != "" {
+						content = c
 					}
 				}
 			}
 		}
 
-		fullResponse.WriteString(content)
-
-		// Extract tool calls from choices
-		var toolCalls []ToolCall
-		if len(chunk.Choices) > 0 {
-			toolCalls = chunk.Choices[0].Delta.ToolCalls
+		// Append reasoning to thinking accumulator
+		if reasoningContent != "" {
+			fullThinking.WriteString(reasoningContent)
+		}
+		// Append content to response accumulator  
+		if content != "" {
+			fullResponse.WriteString(content)
 		}
 
-		// Also handle tool calls from raw JSON if not captured
-		if len(toolCalls) == 0 {
-			var raw map[string]interface{}
-			if err := json.Unmarshal([]byte(lineStr), &raw); err == nil {
-				if choices, ok := raw["choices"].([]interface{}); ok && len(choices) > 0 {
-					if choice, ok := choices[0].(map[string]interface{}); ok {
-						if delta, ok := choice["delta"].(map[string]interface{}); ok {
-							if tc, ok := delta["tool_calls"].([]interface{}); ok {
-								for _, tcRaw := range tc {
-									if tcMap, ok := tcRaw.(map[string]interface{}); ok {
-										var tcItem ToolCall
-										if fn, ok := tcMap["function"].(map[string]interface{}); ok {
-											tcItem.Function.Name = fn["name"].(string)
-											args, _ := json.Marshal(fn["arguments"])
-											var argsMap map[string]interface{}
-											json.Unmarshal(args, &argsMap)
+		// Extract tool calls from raw JSON
+		if choices, ok := raw["choices"].([]interface{}); ok && len(choices) > 0 {
+			if choice, ok := choices[0].(map[string]interface{}); ok {
+				if delta, ok := choice["delta"].(map[string]interface{}); ok {
+					if tc, ok := delta["tool_calls"].([]interface{}); ok {
+						for _, tcRaw := range tc {
+							if tcMap, ok := tcRaw.(map[string]interface{}); ok {
+								var tcItem ToolCall
+								// Always use Index as the key for accumulation
+								tcIndex := 0
+								if idx, ok := tcMap["index"].(float64); ok {
+									tcIndex = int(idx)
+									tcItem.Index = tcIndex
+								}
+								// Get ID for reference
+								if id, ok := tcMap["id"].(string); ok {
+									tcItem.ID = id
+								}
+								if tcType, ok := tcMap["type"].(string); ok {
+									tcItem.Type = tcType
+								}
+								if fn, ok := tcMap["function"].(map[string]interface{}); ok {
+									if name, ok := fn["name"].(string); ok && name != "" {
+										tcItem.Function.Name = name
+									}
+									// Arguments can be a string in streaming mode
+									if args, ok := fn["arguments"]; ok && args != nil {
+										if argsStr, ok := args.(string); ok && argsStr != "" {
+											tcItem.Function.RawArgs = argsStr
+										} else if argsMap, ok := args.(map[string]interface{}); ok {
 											tcItem.Function.Arguments = argsMap
 										}
-										toolCalls = append(toolCalls, tcItem)
 									}
+								}
+								// Always use Index as key for accumulation
+								mapKey := fmt.Sprintf("%d", tcIndex)
+								// Merge with accumulated tool calls
+								if existing, ok := accumulatedToolCalls[mapKey]; ok {
+									if tcItem.Function.Name != "" {
+										existing.Function.Name = tcItem.Function.Name
+									}
+									if tcItem.Function.RawArgs != "" {
+										existing.Function.RawArgs = tcItem.Function.RawArgs
+									} else if tcItem.Function.Arguments != nil {
+										existing.Function.Arguments = tcItem.Function.Arguments
+									}
+									if tcItem.ID != "" {
+										existing.ID = tcItem.ID
+									}
+									accumulatedToolCalls[mapKey] = existing
+								} else {
+									accumulatedToolCalls[mapKey] = &tcItem
 								}
 							}
 						}
@@ -485,24 +554,23 @@ func (c *Client) streamLMStudio(ctx context.Context, client *http.Client, model 
 			}
 		}
 
+		// Convert accumulated map to slice
+		var toolCalls []ToolCall
+		for _, tc := range accumulatedToolCalls {
+			toolCalls = append(toolCalls, *tc)
+		}
+
 		if len(toolCalls) > 0 {
 			log.Printf("DEBUG: Received tool call inside stream! %+v\n", toolCalls)
 		}
 
 		resultChan <- &ChatResponse{
-			Model:     chunk.Model,
-			CreatedAt: chunk.CreatedAt,
 			Message: Message{
 				Role:      "assistant",
 				Content:   fullResponse.String(),
 				ToolCalls: toolCalls,
 			},
-			Done:  chunk.Done,
-			Usage: chunk.Usage,
-		}
-
-		if chunk.Done {
-			break
+			Thinking: fullThinking.String(),
 		}
 	}
 
@@ -586,21 +654,22 @@ func (c *Client) streamOllama(ctx context.Context, client *http.Client, model st
 
 		if len(chunk.Message.ToolCalls) > 0 {
 			log.Printf("DEBUG: Received tool call inside stream! %+v\n", chunk.Message.ToolCalls)
-		}
+	}
 
-		fullResponse.WriteString(chunk.Message.Content)
+	fullResponse.WriteString(chunk.Message.Content)
 
-		resultChan <- &ChatResponse{
-			Model:     chunk.Model,
-			CreatedAt: chunk.CreatedAt,
-			Message: Message{
-				Role:      "assistant",
-				Content:   fullResponse.String(),
-				ToolCalls: chunk.Message.ToolCalls,
-			},
-			Done:  chunk.Done,
-			Usage: chunk.Usage,
-		}
+	resultChan <- &ChatResponse{
+		Model:     chunk.Model,
+		CreatedAt: chunk.CreatedAt,
+		Message: Message{
+			Role:      "assistant",
+			Content:   fullResponse.String(),
+			ToolCalls: chunk.Message.ToolCalls,
+		},
+		Thinking: "",
+		Done:     chunk.Done,
+		Usage:    chunk.Usage,
+	}
 
 		if chunk.Done {
 			break
