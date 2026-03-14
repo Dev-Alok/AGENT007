@@ -95,11 +95,6 @@ func normalizeEndpoint(endpoint string, provider ProviderType) string {
 		return endpoint
 	default:
 		endpoint = strings.TrimSuffix(endpoint, "/")
-		if !strings.Contains(endpoint, ":1234") && !strings.Contains(endpoint, ":11434") {
-			if !strings.HasSuffix(endpoint, "/v1") {
-				endpoint = endpoint + "/v1"
-			}
-		}
 		return endpoint
 	}
 }

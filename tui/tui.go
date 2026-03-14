@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"agentic-coder/pkg/config"
@@ -24,11 +23,10 @@ const (
 )
 
 type TUI struct {
-	agent      *orchestrator.Agent
-	cfg        *config.AgentConfig
-	mu         sync.Mutex
-	history    []Message
-	done       chan struct{}
+	agent   *orchestrator.Agent
+	cfg     *config.AgentConfig
+	history []Message
+	done    chan struct{}
 }
 
 type Message struct {
@@ -49,7 +47,6 @@ func NewTUI(agent *orchestrator.Agent, cfg *config.AgentConfig) *TUI {
 
 func (t *TUI) Run() error {
 	t.renderHeader()
-	go t.renderer()
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
@@ -78,47 +75,18 @@ func (t *TUI) handleInput(input string) {
 		if strings.TrimSpace(input) == "" {
 			return
 		}
-		go t.executeTask(input)
+		t.executeTask(input)
 	}
 }
 
 func (t *TUI) executeTask(task string) {
-	t.mu.Lock()
 	t.history = append(t.history, Message{Role: "user", Content: task, Time: time.Now()})
-	t.mu.Unlock()
 
 	ctx := context.Background()
 	_, err := t.agent.Execute(ctx, task)
+	
 	if err != nil {
-		t.mu.Lock()
 		t.history = append(t.history, Message{Role: "error", Content: err.Error(), Time: time.Now()})
-		t.mu.Unlock()
-	}
-}
-
-func (t *TUI) renderer() {
-	lastLen := 0
-	for {
-		select {
-		case <-t.done:
-			return
-		default:
-		}
-
-		t.mu.Lock()
-		historyCopy := make([]Message, len(t.history))
-		copy(historyCopy, t.history)
-		currentLen := len(historyCopy)
-		t.mu.Unlock()
-
-		if currentLen != lastLen {
-			fmt.Print("\033[H\033[J")
-			t.renderHeader()
-			t.renderHistory()
-			lastLen = currentLen
-		}
-
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -132,9 +100,7 @@ func (t *TUI) showHelp() {
 }
 
 func (t *TUI) clearScreen() {
-	t.mu.Lock()
 	t.history = nil
-	t.mu.Unlock()
 }
 
 func (t *TUI) showConfig() {
@@ -154,20 +120,4 @@ func (t *TUI) renderHeader() {
 	fmt.Printf("%sProvider:%s %s | %sModel:%s     %s\n", colorGrey, colorReset, t.cfg.Provider, colorReset, colorReset, t.cfg.Model)
 	fmt.Printf("%sEndpoint:%s  %s\n", colorGrey, colorReset, t.cfg.LLMEndpoint)
 	fmt.Println(colorGreen + "───────────────────────────────────────────────────────" + colorReset)
-}
-
-func (t *TUI) renderHistory() {
-	for _, msg := range t.history {
-		switch msg.Role {
-		case "user":
-			fmt.Printf("\n%s👤 You:\033[0m %s\n", colorGreen, msg.Content)
-		case "assistant":
-			fmt.Printf("\n%s🤖 Assistant:\n%s%s\n", colorCyan, colorReset, msg.Content)
-		case "tool":
-			fmt.Printf("\n%s⚙️ Tool: %s\033[0m\n", colorYellow, msg.ToolName)
-			fmt.Printf("%s  Output:\n%s%s\n", colorGrey, colorReset, msg.Content)
-		case "error":
-			fmt.Printf("\n%s❌ Error:\033[0m %s\n", colorRed, msg.Content)
-		}
-	}
 }

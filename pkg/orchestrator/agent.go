@@ -27,6 +27,7 @@ type Agent struct {
 	conversation []Message
 
 	reflectionAttempts map[string]int // Track retry attempts per error pattern
+	outputCallback     func(string)   // Callback for streaming output
 }
 
 // Message represents a chat message in the conversation history.
@@ -46,6 +47,7 @@ func NewAgent(registry *tools.Registry, cfg *config.AgentConfig) *Agent {
 		contextWindow:      cfg.ContextWindow,
 		maxIterations:      5,
 		reflectionAttempts: make(map[string]int),
+		outputCallback:     nil,
 	}
 }
 
@@ -58,7 +60,15 @@ func NewAgentWithTimeout(registry *tools.Registry, cfg *config.AgentConfig, time
 		contextWindow:      cfg.ContextWindow,
 		maxIterations:      5,
 		reflectionAttempts: make(map[string]int),
+		outputCallback:     nil,
 	}
+}
+
+// SetOutputCallback sets a callback function for streaming output.
+func (a *Agent) SetOutputCallback(callback func(string)) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.outputCallback = callback
 }
 
 // SetModel allows changing the LLM model at runtime.
@@ -299,8 +309,7 @@ func (a *Agent) getLLMResponseStream(ctx context.Context, finalOutput *strings.B
 	resultChan := make(chan *llm.ChatResponse, 100) // Buffer stream
 	errChan := make(chan error, 1)
 
-	// Since Go lacks robust tuple overrides right now without modifying signature, we mutate standard ChatRequest internally
-	a.llmClient.SetTools(nativeTools) // Will create SetTools method
+	a.llmClient.SetTools(nativeTools)
 	go a.llmClient.StreamChat(ctx, a.model, llmMessages, false, resultChan, errChan)
 
 	var fullResponse strings.Builder
@@ -324,25 +333,28 @@ func (a *Agent) getLLMResponseStream(ctx context.Context, finalOutput *strings.B
 
 			finalChunk = resp
 
-			// We print just the new chunks to standard output for real time feel
+			newContent := strings.TrimPrefix(resp.Message.Content, fullResponse.String())
+			fullResponse.WriteString(newContent)
+			finalOutput.WriteString(newContent)
+
+			if a.outputCallback != nil {
+				a.mu.RLock()
+				callback := a.outputCallback
+				a.mu.RUnlock()
+				if callback != nil {
+					callback(newContent)
+				}
+			}
+
 			if !formattedThinking {
-				fmt.Print("\n\033[36m🤖 Assistant:\033[0m\n")
-				finalOutput.WriteString("\n\033[36m🤖 Assistant:\033[0m\n")
+				fmt.Println()
+				fmt.Print("\033[36m🤖 Assistant:\033[0m ")
+				finalOutput.WriteString("\n🤖 Assistant: ")
 				formattedThinking = true
 			}
 
-			// Calculate the diff to print only newly generated characters
-			newContent := strings.TrimPrefix(resp.Message.Content, fullResponse.String())
-
-			// Highlight <think> tags gracefully. Fast check:
-			displayContent := newContent
-			if strings.Contains(fullResponse.String()+newContent, "<think>") && !strings.Contains(fullResponse.String()+newContent, "</think>") {
-				displayContent = fmt.Sprintf("\033[90m%s\033[0m", newContent) // Dim grey
-			}
-
-			fmt.Print(displayContent)
-			finalOutput.WriteString(newContent)
-			fullResponse.WriteString(newContent)
+			// Print with immediate flush
+			fmt.Print(newContent)
 		case <-ctx.Done():
 			return fullResponse.String(), nil, ctx.Err()
 		}

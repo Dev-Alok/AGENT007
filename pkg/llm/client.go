@@ -76,18 +76,28 @@ type ToolParameterDefinition struct {
 }
 
 type Message struct {
-	Role      string     `json:"role"`
-	Content   string     `json:"content"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
-	ToolName  string     `json:"tool_name,omitempty"`
+	Role             string     `json:"role"`
+	Content          string     `json:"content"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+	ToolName         string     `json:"tool_name,omitempty"`
 }
 
 type ChatResponse struct {
 	Model     string    `json:"model"`
 	CreatedAt time.Time `json:"created_at"`
 	Message   Message   `json:"message"`
+	Choices   []Choice  `json:"choices"`
 	Done      bool      `json:"done"`
 	Usage     Usage     `json:"usage,omitempty"`
+}
+
+type Choice struct {
+	Index        int         `json:"index"`
+	Delta        Message     `json:"delta"`
+	Message      Message     `json:"message"`
+	LogProbs     interface{} `json:"logprobs"`
+	FinishReason string      `json:"finish_reason"`
 }
 
 type Usage struct {
@@ -392,6 +402,8 @@ func (c *Client) streamLMStudio(ctx context.Context, client *http.Client, model 
 		}
 
 		lineStr := strings.TrimSpace(string(line))
+		log.Printf("LM Studio raw response: %s", lineStr)
+
 		if lineStr == "data: [DONE]" || lineStr == "[DONE]" {
 			break
 		}
@@ -406,11 +418,76 @@ func (c *Client) streamLMStudio(ctx context.Context, client *http.Client, model 
 			continue
 		}
 
-		if len(chunk.Message.ToolCalls) > 0 {
-			log.Printf("DEBUG: Received tool call inside stream! %+v\n", chunk.Message.ToolCalls)
+		// Extract content from choices[0].delta
+		var content string
+		if len(chunk.Choices) > 0 {
+			delta := chunk.Choices[0].Delta
+			// First check reasoning_content (thinking), then content
+			if delta.Content != "" {
+				content = delta.Content
+			}
+			// reasoning_content should also be included
+			if delta.ToolName != "" {
+				// This is reasoning content
+			}
 		}
 
-		fullResponse.WriteString(chunk.Message.Content)
+		// Handle reasoning_content field in delta
+		if content == "" {
+			// Try to parse the raw JSON for reasoning_content
+			var raw map[string]interface{}
+			if err := json.Unmarshal([]byte(lineStr), &raw); err == nil {
+				if choices, ok := raw["choices"].([]interface{}); ok && len(choices) > 0 {
+					if choice, ok := choices[0].(map[string]interface{}); ok {
+						if delta, ok := choice["delta"].(map[string]interface{}); ok {
+							if rc, ok := delta["reasoning_content"].(string); ok && rc != "" {
+								content = rc
+							}
+						}
+					}
+				}
+			}
+		}
+
+		fullResponse.WriteString(content)
+
+		// Extract tool calls from choices
+		var toolCalls []ToolCall
+		if len(chunk.Choices) > 0 {
+			toolCalls = chunk.Choices[0].Delta.ToolCalls
+		}
+
+		// Also handle tool calls from raw JSON if not captured
+		if len(toolCalls) == 0 {
+			var raw map[string]interface{}
+			if err := json.Unmarshal([]byte(lineStr), &raw); err == nil {
+				if choices, ok := raw["choices"].([]interface{}); ok && len(choices) > 0 {
+					if choice, ok := choices[0].(map[string]interface{}); ok {
+						if delta, ok := choice["delta"].(map[string]interface{}); ok {
+							if tc, ok := delta["tool_calls"].([]interface{}); ok {
+								for _, tcRaw := range tc {
+									if tcMap, ok := tcRaw.(map[string]interface{}); ok {
+										var tcItem ToolCall
+										if fn, ok := tcMap["function"].(map[string]interface{}); ok {
+											tcItem.Function.Name = fn["name"].(string)
+											args, _ := json.Marshal(fn["arguments"])
+											var argsMap map[string]interface{}
+											json.Unmarshal(args, &argsMap)
+											tcItem.Function.Arguments = argsMap
+										}
+										toolCalls = append(toolCalls, tcItem)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if len(toolCalls) > 0 {
+			log.Printf("DEBUG: Received tool call inside stream! %+v\n", toolCalls)
+		}
 
 		resultChan <- &ChatResponse{
 			Model:     chunk.Model,
@@ -418,7 +495,7 @@ func (c *Client) streamLMStudio(ctx context.Context, client *http.Client, model 
 			Message: Message{
 				Role:      "assistant",
 				Content:   fullResponse.String(),
-				ToolCalls: chunk.Message.ToolCalls,
+				ToolCalls: toolCalls,
 			},
 			Done:  chunk.Done,
 			Usage: chunk.Usage,
