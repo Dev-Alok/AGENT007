@@ -1,5 +1,11 @@
 package tui
 
+// IMPORTANT: This is the SOLE entry point for all user input and output!
+// - All terminal output MUST go through TUI methods (print, displayMarkdown, etc.)
+// - NO direct fmt.Print, fmt.Println anywhere in this package
+// - All output flows through TUI for consistent formatting
+// - Input is read via TUI and passed to agent
+
 import (
 	"bufio"
 	"context"
@@ -9,32 +15,32 @@ import (
 
 	"agentic-coder/pkg/config"
 	"agentic-coder/pkg/orchestrator"
+	"agentic-coder/tui/renderer"
+	"charm.land/lipgloss/v2"
 )
 
-const (
-	Reset  = "\033[0m"
-	Bold   = "\033[1m"
-	Dim    = "\033[2m"
-
-	Green  = "\033[32m"
-	Yellow = "\033[33m"
-	Cyan   = "\033[36m"
-	Grey   = "\033[90m"
-	Red    = "\033[31m"
-	Purple = "\033[35m"
+var (
+	accentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("86"))
+	dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	promptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("154")).Bold(true)
 )
 
 type TUI struct {
-	agent   *orchestrator.Agent
-	cfg     *config.AgentConfig
-	done    chan struct{}
+	agent          *orchestrator.Agent
+	cfg            *config.AgentConfig
+	done           chan struct{}
+	markdownRender *renderer.MarkdownRenderer
+	connected      bool
 }
 
-func NewTUI(agent *orchestrator.Agent, cfg *config.AgentConfig) *TUI {
+func NewTUI(agent *orchestrator.Agent, cfg *config.AgentConfig, connected bool) *TUI {
+	mr, _ := renderer.NewAutoStyleRenderer()
 	return &TUI{
-		agent: agent,
-		cfg:   cfg,
-		done:  make(chan struct{}),
+		agent:          agent,
+		cfg:            cfg,
+		done:           make(chan struct{}),
+		markdownRender: mr,
+		connected:      connected,
 	}
 }
 
@@ -42,9 +48,17 @@ func (t *TUI) Run() error {
 	t.clearScreen()
 	t.renderHeader()
 
+	// Show connection status via TUI
+	t.printConnectionStatus()
+
+	// Set up streaming callback - all output goes through TUI
+	t.agent.SetStreamCallback(func(content string) {
+		t.print(content)
+	})
+
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
-		fmt.Printf("\n%s%s➜%s ", Bold, Green, Reset)
+		fmt.Printf("\n%s ", promptStyle.Render("➜"))
 		if !scanner.Scan() {
 			close(t.done)
 			return nil
@@ -53,6 +67,30 @@ func (t *TUI) Run() error {
 		input := scanner.Text()
 		t.handleInput(input)
 	}
+}
+
+// print handles all output - formats and displays markdown
+func (t *TUI) print(content string) {
+	if content == "" {
+		return
+	}
+
+	// Try to render as markdown first
+	cleanContent := strings.TrimSpace(content)
+	cleanContent = strings.ReplaceAll(cleanContent, "\r\n", "\n")
+
+	rendered := cleanContent
+	if t.markdownRender != nil {
+		out, err := t.markdownRender.Render(cleanContent)
+		if err == nil && out != "" && out != cleanContent {
+			rendered = out
+		} else {
+			// Fall back to simple formatting
+			rendered = renderer.FormatSimple(cleanContent)
+		}
+	}
+
+	fmt.Print(rendered)
 }
 
 func (t *TUI) handleInput(input string) {
@@ -68,6 +106,8 @@ func (t *TUI) handleInput(input string) {
 		t.renderHeader()
 	case "/config", "config":
 		t.showConfig()
+	case "/style", "style":
+		t.showStyles()
 	default:
 		if strings.TrimSpace(input) == "" {
 			return
@@ -80,167 +120,103 @@ func (t *TUI) executeTask(task string) {
 	fmt.Println()
 
 	ctx := context.Background()
-	_, err := t.agent.Execute(ctx, task)
-	
-	// Get the thinking and content from agent
-	thinking, content := t.agent.GetCurrentOutput()
-	
-	// Display thinking if exists and is different from content
-	if thinking != "" && thinking != content {
-		t.displayBlock("🤔 Thinking", thinking, Purple)
-		fmt.Println()
-	}
-	
-	// Display content if exists
-	if content != "" {
-		t.displayBlock("🤖 Assistant", content, Cyan)
-	}
-	
-	if err != nil {
-		t.displayBlock("✗ Error", err.Error(), Red)
-	}
-}
-
-func (t *TUI) displayBlock(title, content string, titleColor string) {
-	borderColor := Grey
-	
-	// First check if content was already printed (starts with common prefixes)
-	if strings.HasPrefix(content, "\n\033[36m🤖 Assistant:\033[0m\n") {
-		// Content was already printed by orchestrator, just show thinking part
-		content = strings.TrimPrefix(content, "\n\033[36m🤖 Assistant:\033[0m\n")
-	}
-	
-	// Remove any existing ANSI escape sequences for cleaner display
-	// This is a simplified approach - we just display what we have
-	
-	lines := wrapText(content, 62)
-	
-	// Draw top border
-	fmt.Printf("%s┌", borderColor)
-	for i := 0; i < 66; i++ {
-		fmt.Printf("─")
-	}
-	fmt.Printf("┐%s\n", Reset)
-	
-	// Title
-	fmt.Printf("%s│%s %s %s%s\n", borderColor, Reset, titleColor, title, Reset)
-	
-	// Separator
-	fmt.Printf("%s│", borderColor)
-	for i := 0; i < 66; i++ {
-		fmt.Printf("─")
-	}
-	fmt.Printf("│%s\n", Reset)
-	
-	// Content
-	for i, line := range lines {
-		padding := 66 - len(line)
-		if i == len(lines)-1 {
-			// Last line - use └┘
-			fmt.Printf("%s│%s %s%s%s%s└%s\n", borderColor, Reset, line, strings.Repeat(" ", padding), borderColor, Reset)
-		} else {
-			fmt.Printf("%s│%s %s%s%s│%s\n", borderColor, Reset, line, strings.Repeat(" ", padding), borderColor, Reset)
-		}
-	}
-	
-	// Bottom border
-	fmt.Printf("%s└", borderColor)
-	for i := 0; i < 66; i++ {
-		fmt.Printf("─")
-	}
-	fmt.Printf("┘%s", Reset)
-}
-
-func wrapText(text string, width int) []string {
-	// First clean the text of ANSI codes for proper wrapping
-	clean := stripANSI(text)
-	
-	if len(clean) <= width {
-		return []string{clean}
-	}
-	
-	var lines []string
-	words := strings.Fields(clean)
-	currentLine := ""
-	
-	for _, word := range words {
-		if len(currentLine)+len(word)+1 > width {
-			if currentLine != "" {
-				lines = append(lines, currentLine)
-			}
-			currentLine = word
-		} else {
-			if currentLine != "" {
-				currentLine += " "
-			}
-			currentLine += word
-		}
-	}
-	if currentLine != "" {
-		lines = append(lines, currentLine)
-	}
-	
-	return lines
-}
-
-func stripANSI(s string) string {
-	result := strings.Builder{}
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\033' {
-			// Skip until we find the letter at the end of escape sequence
-			for i < len(s) && s[i] != 'm' {
-				i++
-			}
-			continue
-		}
-		result.WriteByte(s[i])
-	}
-	return result.String()
+	_, _ = t.agent.Execute(ctx, task)
 }
 
 func (t *TUI) showHelp() {
-	t.displayBlock("📖 Help", `Commands:
-  /help      - Show this help
-  /clear     - Clear screen  
-  /config    - Show configuration
-  /exit      - Exit
-  q          - Exit (shortcut)
+	t.print(`# Available Commands
 
-Type your request and press Enter.
-The agent will use tools automatically.`, Yellow)
+- **/help** - Show this help message
+- **/clear** - Clear the screen
+- **/config** - Show current configuration  
+- **/style** - Show available markdown styles
+- **/exit** or **q** - Exit the application
+
+## Available Tools
+
+The agent can use these tools automatically:
+
+- **read_file** - Read file contents
+- **write_file** - Write content to files
+- **run_command** - Execute shell commands
+- **list_directory** - List directory contents
+- **search_file** - Search for files by name
+- **search_directory** - Search for directories
+- **grep_search** - Search file contents
+- **replace_file_content** - Find and replace in files
+- **read_url** - Fetch web content
+- **file_exists** - Check if file/directory exists
+- **get_working_directory** - Get current directory
+- **get_env_vars** - List environment variables
+- **glob** - Find files by pattern
+- **line_count** - Count lines in file
+- **file_extension** - Get file extension
+
+Type your request and press Enter to start!`)
+}
+
+func (t *TUI) showConfig() {
+	t.print(fmt.Sprintf(`# Current Configuration
+
+- **Provider:** %s
+- **Model:** %s  
+- **Endpoint:** %s
+- **Context Window:** %d tokens
+- **Temperature:** %.2f
+- **Timeout:** %d seconds`,
+		t.cfg.Provider, t.cfg.Model, t.cfg.LLMEndpoint,
+		t.cfg.ContextWindow, t.cfg.Temperature, t.cfg.LLMTimeoutSeconds))
+}
+
+func (t *TUI) showStyles() {
+	t.print(`# Available Markdown Styles
+
+- dark - Dark theme (default)
+- light - Light theme
+- pink - Pink theme
+- aurora - Aurora theme
+- notty - Notty theme
+- chocolate - Chocolate theme
+
+Set the GLAMOUR_STYLE environment variable to change the default style.`)
 }
 
 func (t *TUI) clearScreen() {
 	fmt.Print("\033[2J\033[H")
 }
 
-func (t *TUI) showConfig() {
-	info := fmt.Sprintf(`Provider:    %s
-Model:       %s
-Endpoint:    %s
-Context:     %d tokens
-Temperature: %.2f
-Timeout:     %d seconds`, 
-		t.cfg.Provider, t.cfg.Model, t.cfg.LLMEndpoint, 
-		t.cfg.ContextWindow, t.cfg.Temperature, t.cfg.LLMTimeoutSeconds)
-	
-	t.displayBlock("⚙️ Configuration", info, Yellow)
+func (t *TUI) renderHeader() {
+	headerBorder := lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(lipgloss.Color("238")).
+		Padding(0, 1)
+
+	headerContent := lipgloss.JoinVertical(
+		lipgloss.Left,
+		accentStyle.Render("  🤖 Agentic Coder")+dimStyle.Render(" - LM Studio Edition"),
+		"",
+		dimStyle.Render("  Provider: ")+accentStyle.Render(string(t.cfg.Provider))+dimStyle.Render("    Model: ")+accentStyle.Render(t.cfg.Model),
+		dimStyle.Render("  Endpoint: ")+accentStyle.Render(t.cfg.LLMEndpoint),
+	)
+
+	fmt.Println(headerBorder.Render(headerContent))
+	fmt.Println()
+
+	helpText := dimStyle.Render("Commands: ") +
+		accentStyle.Render("/help") + dimStyle.Render(" | ") +
+		accentStyle.Render("/clear") + dimStyle.Render(" | ") +
+		accentStyle.Render("/config") + dimStyle.Render(" | ") +
+		accentStyle.Render("/style") + dimStyle.Render(" | ") +
+		accentStyle.Render("/exit")
+
+	fmt.Println(helpText)
+	fmt.Println()
 }
 
-func (t *TUI) renderHeader() {
-	borderColor := Grey
-	accentColor := Cyan
-	
-	fmt.Printf("%s╔═══════════════════════════════════════════════════════════════════╗%s\n", borderColor, Reset)
-	fmt.Printf("%s║%s  %s🤖 Agentic Coder%s                                             %s║%s\n", borderColor, Reset, Bold+accentColor, Reset, borderColor, Reset)
-	fmt.Printf("%s║%s  %sLM Studio Edition%s                                         %s║%s\n", borderColor, Reset, Dim, Reset, borderColor, Reset)
-	fmt.Printf("%s╠═══════════════════════════════════════════════════════════════════╣%s\n", borderColor, Reset)
-	fmt.Printf("%s║%s  %sProvider:%s  %s%-12s  %sModel:%s     %s%-25s %s║%s\n", 
-		borderColor, Reset, Dim, Reset, Cyan, t.cfg.Provider, Dim, Reset, Cyan, t.cfg.Model, borderColor, Reset)
-	fmt.Printf("%s║%s  %sEndpoint:%s %s%-45s %s║%s\n", 
-		borderColor, Reset, Dim, Reset, Cyan, t.cfg.LLMEndpoint, borderColor, Reset)
-	fmt.Printf("%s╚═══════════════════════════════════════════════════════════════════╝%s\n", borderColor, Reset)
-	
-	fmt.Printf("\n%s%sCommands:%s /help %s| %s/clear %s| %s/config %s| %s/exit%s\n\n", 
-		Dim, Reset, Green, Dim, Reset, Green, Dim, Reset, Green, Reset)
+func (t *TUI) printConnectionStatus() {
+	if t.connected {
+		t.print("✅ Connected to " + string(t.cfg.Provider) + " at " + t.cfg.LLMEndpoint)
+	} else {
+		t.print("⚠️ Could not connect to " + string(t.cfg.Provider) + " at " + t.cfg.LLMEndpoint + " - continuing anyway")
+	}
 }

@@ -1,5 +1,8 @@
 package orchestrator
 
+// IMPORTANT: All output must go through streamCallback - NO direct fmt.Print or os.Stdout!
+// This ensures all output is handled by the TUI for proper formatting and display.
+
 import (
 	"context"
 	"encoding/json"
@@ -14,6 +17,9 @@ import (
 	"agentic-coder/pkg/tools"
 )
 
+// StreamCallback is a function that receives chunks of streaming output
+type StreamCallback func(content string)
+
 // Agent manages the conversation state and implements the Thought->Action->Observation loop.
 type Agent struct {
 	registry      *tools.Registry
@@ -26,15 +32,16 @@ type Agent struct {
 	conversation []Message
 
 	reflectionAttempts map[string]int
+	streamCallback     StreamCallback
 }
 
 // Message represents a chat message in the conversation history.
 type Message struct {
-	Role        string         `json:"role"`
-	Content     string         `json:"content"`
-	ToolCalls   []llm.ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID  string         `json:"tool_call_id,omitempty"`
-	ToolName    string         `json:"tool_name,omitempty"`
+	Role       string         `json:"role"`
+	Content    string         `json:"content"`
+	ToolCalls  []llm.ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
+	ToolName   string         `json:"tool_name,omitempty"`
 }
 
 // NewAgent creates a new agent with the specified tool registry and configuration.
@@ -66,6 +73,23 @@ func (a *Agent) SetModel(model string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.model = model
+}
+
+// SetStreamCallback sets a callback for streaming output
+func (a *Agent) SetStreamCallback(callback StreamCallback) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.streamCallback = callback
+}
+
+// stream writes content to the callback if available
+func (a *Agent) stream(content string) {
+	a.mu.RLock()
+	callback := a.streamCallback
+	a.mu.RUnlock()
+	if callback != nil {
+		callback(content)
+	}
 }
 
 // getNativeTools maps internal Registry tools to LLM-native tool schemas.
@@ -101,6 +125,7 @@ func (a *Agent) getNativeTools() []llm.Tool {
 // Execute runs the agent's main loop for a given task.
 // Returns when task is complete or context is cancelled.
 // Each execution starts fresh with no conversation history.
+// Output is returned to the caller (TUI handles rendering).
 func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 	nativeTools := a.getNativeTools()
 
@@ -134,12 +159,12 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 		iteration = i + 1
 
 		// Step 1: Thought - Get LLM response via streaming
-		response, toolCalls, err := a.getLLMResponseStream(ctx, &finalOutput)
+		response, toolCalls, err := a.getLLMResponseStream(ctx, &finalOutput, a.streamCallback)
 		if err != nil {
 			return finalOutput.String(), fmt.Errorf("LLM error at iteration %d: %w", iteration, err)
 		}
 
-	// Append the assistant's unified response once before checking success states
+		// Append the assistant's unified response once before checking success states
 		// Convert tool calls to have proper map arguments for serialization
 		normalizedToolCalls := make([]llm.ToolCall, len(toolCalls))
 		for i, tc := range toolCalls {
@@ -187,15 +212,15 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 
 					toolMu.Lock()
 					msg := fmt.Sprintf("\n⚠️ Tool '%s' failed: %v\n", toolCall.Function.Name, errMsg)
-					fmt.Fprint(os.Stdout, msg)
 					finalOutput.WriteString(msg)
+					a.stream(msg)
 					toolMu.Unlock()
 					return
 				}
 
-			// Execute tool
-			args, _ := toolCall.Function.ParseArguments()
-			result, err := tool.Execute(ctx, args)
+				// Execute tool
+				args, _ := toolCall.Function.ParseArguments()
+				result, err := tool.Execute(ctx, args)
 
 				// Handle Error
 				if err != nil {
@@ -210,18 +235,18 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 					}
 					a.mu.Unlock()
 
-				toolMu.Lock()
-				msg := fmt.Sprintf("\n⚠️ Tool '%s' failed: %v (attempt %d/3)\n", toolCall.Function.Name, err, attempts+1)
-				fmt.Fprint(os.Stdout, msg)
-				finalOutput.WriteString(msg)
-				toolMu.Unlock()
-				return
-			}
+					toolMu.Lock()
+					msg := fmt.Sprintf("\n⚠️ Tool '%s' failed: %v (attempt %d/3)\n", toolCall.Function.Name, err, attempts+1)
+					finalOutput.WriteString(msg)
+					a.stream(msg)
+					toolMu.Unlock()
+					return
+				}
 
 				// Handle Success
 				toolMu.Lock()
 
-			// Generate dynamic context-aware message based on the tool executed
+				// Generate dynamic context-aware message based on the tool executed
 				var dynamicMsg string
 				switch toolCall.Function.Name {
 				case "list_directory":
@@ -244,12 +269,12 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 					dynamicMsg = fmt.Sprintf("Executed tool: %s", toolCall.Function.Name)
 				}
 
-			msg := fmt.Sprintf("\n✅ \033[32m%s\033[0m\n", dynamicMsg)
-				fmt.Fprint(os.Stdout, msg)
+				msg := fmt.Sprintf("\n✅ %s\n", dynamicMsg)
 				finalOutput.WriteString(msg)
+				a.stream(msg)
 				toolMu.Unlock()
 
-			a.mu.Lock()
+				a.mu.Lock()
 				a.conversation = append(a.conversation,
 					Message{Role: "tool", Content: result, ToolCallID: toolCall.ID, ToolName: toolCall.Function.Name},
 				)
@@ -269,7 +294,7 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 }
 
 // getLLMResponseStream sends the conversation to LLM and processes the streamed response.
-func (a *Agent) getLLMResponseStream(ctx context.Context, finalOutput *strings.Builder) (string, []llm.ToolCall, error) {
+func (a *Agent) getLLMResponseStream(ctx context.Context, finalOutput *strings.Builder, callback StreamCallback) (string, []llm.ToolCall, error) {
 	a.mu.RLock()
 	conversation := make([]Message, len(a.conversation))
 	copy(conversation, a.conversation)
@@ -327,20 +352,30 @@ func (a *Agent) getLLMResponseStream(ctx context.Context, finalOutput *strings.B
 
 			finalChunk = resp
 
-		// Get content from response
-		newContent := ""
-		if resp.Message.Content != "" {
-			newContent = strings.TrimPrefix(resp.Message.Content, fullResponse.String())
-		}
+			// Get content from response
+			newContent := ""
+			newThinking := ""
+			if resp.Message.Content != "" {
+				newContent = strings.TrimPrefix(resp.Message.Content, fullResponse.String())
+			}
+			if resp.Message.ReasoningContent != "" {
+				newThinking = resp.Message.ReasoningContent
+			}
 
-		if newContent != "" {
-			fullResponse.WriteString(newContent)
-			finalOutput.WriteString(newContent)
-		}
+			if newThinking != "" {
+				fullResponse.WriteString(newThinking)
+				finalOutput.WriteString(newThinking)
+				if callback != nil {
+					callback(newThinking)
+				}
+			}
 
-		// Stream content as it comes
 			if newContent != "" {
-				fmt.Fprint(os.Stdout, newContent)
+				fullResponse.WriteString(newContent)
+				finalOutput.WriteString(newContent)
+				if callback != nil {
+					callback(newContent)
+				}
 			}
 		case <-ctx.Done():
 			return fullResponse.String(), nil, ctx.Err()
