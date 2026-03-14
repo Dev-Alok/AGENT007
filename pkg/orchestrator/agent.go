@@ -46,24 +46,32 @@ type Message struct {
 
 // NewAgent creates a new agent with the specified tool registry and configuration.
 func NewAgent(registry *tools.Registry, cfg *config.AgentConfig) *Agent {
+	maxIter := cfg.MaxIterations
+	if maxIter <= 0 {
+		maxIter = 20
+	}
 	return &Agent{
 		registry:           registry,
 		llmClient:          llm.NewClient(cfg.LLMEndpoint, cfg.APIKey, llm.ProviderType(cfg.Provider), cfg.Temperature, cfg.NumPredict, cfg.TopK, cfg.TopP, cfg.RepeatPenalty, cfg.Seed),
 		model:              cfg.Model,
 		contextWindow:      cfg.ContextWindow,
-		maxIterations:      5,
+		maxIterations:      maxIter,
 		reflectionAttempts: make(map[string]int),
 	}
 }
 
 // NewAgentWithTimeout creates a new agent with custom timeout.
 func NewAgentWithTimeout(registry *tools.Registry, cfg *config.AgentConfig, timeout time.Duration) *Agent {
+	maxIter := cfg.MaxIterations
+	if maxIter <= 0 {
+		maxIter = 20
+	}
 	return &Agent{
 		registry:           registry,
 		llmClient:          llm.NewClientWithTimeout(cfg.LLMEndpoint, cfg.APIKey, llm.ProviderType(cfg.Provider), cfg.Temperature, cfg.NumPredict, cfg.TopK, cfg.TopP, cfg.RepeatPenalty, cfg.Seed, timeout),
 		model:              cfg.Model,
 		contextWindow:      cfg.ContextWindow,
-		maxIterations:      5,
+		maxIterations:      maxIter,
 		reflectionAttempts: make(map[string]int),
 	}
 }

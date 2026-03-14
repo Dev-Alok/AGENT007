@@ -17,18 +17,19 @@ const (
 // AgentConfig represents the configuration layout for the agent application.
 // Used instead of CLI flags to support easy profile switching.
 type AgentConfig struct {
-	LLMEndpoint       string        `json:"llm_endpoint"`
-	Model             string        `json:"model"`
-	ContextWindow     int           `json:"context_window"`
-	Temperature       float32       `json:"temperature"`
-	NumPredict        int           `json:"num_predict"`
-	TopK              int           `json:"top_k"`
-	TopP              float32       `json:"top_p"`
-	RepeatPenalty     float32       `json:"repeat_penalty"`
-	Seed              int           `json:"seed"`
-	LLMTimeoutSeconds int           `json:"llm_timeout_seconds"`
-	Provider          ProviderType  `json:"provider"`
-	APIKey            string        `json:"api_key,omitempty"`
+	LLMEndpoint       string       `json:"llm_endpoint"`
+	Model             string       `json:"model"`
+	ContextWindow     int          `json:"context_window"`
+	Temperature       float32      `json:"temperature"`
+	NumPredict        int          `json:"num_predict"`
+	TopK              int          `json:"top_k"`
+	TopP              float32      `json:"top_p"`
+	RepeatPenalty     float32      `json:"repeat_penalty"`
+	Seed              int          `json:"seed"`
+	LLMTimeoutSeconds int          `json:"llm_timeout_seconds"`
+	Provider          ProviderType `json:"provider"`
+	APIKey            string       `json:"api_key,omitempty"`
+	MaxIterations     int          `json:"max_iterations,omitempty"` // Max tool call iterations per task
 }
 
 // LoadConfig parses a config.json file and returns an initialized AgentConfig.
@@ -47,6 +48,7 @@ func LoadConfig(filePath string) (*AgentConfig, error) {
 		LLMTimeoutSeconds: 300,
 		Provider:          ProviderLMStudio,
 		APIKey:            "",
+		MaxIterations:     20,
 	}
 
 	data, err := os.ReadFile(filePath)
