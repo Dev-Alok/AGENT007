@@ -5,7 +5,6 @@ package renderer
 // as it's specifically for streaming output formatting.
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
 	"regexp"
@@ -41,7 +40,7 @@ func (r *StreamingRenderer) Stream(content string) {
 	r.mu.Unlock()
 
 	formatted := r.formatPartialMarkdown(content)
-	fmt.Print(formatted)
+	os.Stdout.WriteString(formatted)
 }
 
 // formatPartialMarkdown does basic markdown formatting for streaming
@@ -176,11 +175,11 @@ func StreamWithPipe(content string) {
 
 	pipe, err := cmd.StdinPipe()
 	if err != nil {
-		fmt.Print(content)
+		os.Stdout.WriteString(content)
 		return
 	}
 
-	fmt.Fprint(pipe, content)
+	os.Stdout.WriteString(content)
 	pipe.Close()
 	cmd.Wait()
 }

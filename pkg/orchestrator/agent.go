@@ -220,6 +220,7 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 		}
 
 		iteration = i + 1
+		a.emitWithMeta(EventIteration, fmt.Sprintf("Iteration %d/%d", iteration, a.maxIterations), IterationMeta{Current: iteration, Max: a.maxIterations})
 
 		response, toolCalls, err := a.getLLMResponseStream(ctx, &finalOutput, a.streamCallback)
 		if err != nil {
@@ -253,7 +254,6 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 
 		if !toolsUsed {
 			toolsUsed = true
-			a.emitWithMeta(EventPlanning, fmt.Sprintf("Task: %s", task), nil)
 		}
 
 		a.emitWithMeta(EventIteration, fmt.Sprintf("Iteration %d/%d", iteration, a.maxIterations), IterationMeta{Current: iteration, Max: a.maxIterations})
@@ -345,9 +345,13 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 
 				a.emitWithMeta(EventToolResult, dynamicMsg, ToolCallMeta{ToolName: toolCall.Function.Name, Args: args})
 
-				msg := fmt.Sprintf("\n✅ %s\n", dynamicMsg)
-				finalOutput.WriteString(msg)
-				a.stream(msg)
+				switch toolCall.Function.Name {
+				case "run_command", "grep_search":
+					msg := fmt.Sprintf("\n%s\n", result)
+					finalOutput.WriteString(msg)
+					a.stream(msg)
+				}
+
 				toolMu.Unlock()
 
 				a.mu.Lock()

@@ -13,6 +13,7 @@ import (
 	"agentic-coder/pkg/orchestrator"
 	"agentic-coder/tui/renderer"
 	"charm.land/lipgloss/v2"
+	md "github.com/MichaelMure/go-term-markdown"
 )
 
 var (
@@ -25,28 +26,32 @@ var (
 	infoStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
 	thinkingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("98"))
 	boldStyle     = lipgloss.NewStyle().Bold(true)
+	mutedStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 )
 
 type TUI struct {
-	agent          *orchestrator.Agent
-	cfg            *config.AgentConfig
-	done           chan struct{}
-	markdownRender *renderer.MarkdownRenderer
-	connected      bool
-	currentTask    string
-	lastStatus     string
-	taskStartTime  time.Time
-	iteration      int
-	maxIterations  int
+	agent            *orchestrator.Agent
+	cfg              *config.AgentConfig
+	done             chan struct{}
+	streamRenderer   *renderer.StreamingRenderer
+	connected        bool
+	currentTask      string
+	lastStatus       string
+	taskStartTime    time.Time
+	iteration        int
+	maxIterations    int
+	toolsUsed        bool
+	toolResultBuffer strings.Builder
+	inToolResult     bool
+	lastStatusBar    string
 }
 
 func NewTUI(agent *orchestrator.Agent, cfg *config.AgentConfig, connected bool) *TUI {
-	mr, _ := renderer.NewAutoStyleRenderer()
 	tui := &TUI{
 		agent:          agent,
 		cfg:            cfg,
 		done:           make(chan struct{}),
-		markdownRender: mr,
+		streamRenderer: renderer.NewStreamingRenderer(),
 		connected:      connected,
 		maxIterations:  cfg.MaxIterations,
 	}
@@ -62,7 +67,7 @@ func (t *TUI) Run() error {
 	t.printConnectionStatus()
 
 	t.agent.SetStreamCallback(func(content string) {
-		t.output(content)
+		t.streamOutput(content)
 	})
 
 	t.agent.SetEventCallback(func(event orchestrator.AgentEvent) {
@@ -90,9 +95,16 @@ func (t *TUI) renderPrompt() {
 func (t *TUI) handleEvent(event orchestrator.AgentEvent) {
 	switch event.Type {
 	case orchestrator.EventStatus:
-		t.lastStatus = event.Message
 		if strings.Contains(event.Message, "Starting") {
 			t.taskStartTime = time.Now()
+			t.currentTask = ""
+			t.iteration = 0
+			t.toolsUsed = false
+			t.lastStatus = "Starting"
+			t.toolResultBuffer.Reset()
+			t.inToolResult = false
+			t.lastStatusBar = ""
+			t.output(formatStart())
 		}
 
 	case orchestrator.EventIteration:
@@ -100,28 +112,32 @@ func (t *TUI) handleEvent(event orchestrator.AgentEvent) {
 		if err := json.Unmarshal(event.Metadata, &meta); err == nil {
 			t.iteration = meta.Current
 			t.maxIterations = meta.Max
-			t.lastStatus = formatIteration(meta.Current, meta.Max)
+			t.lastStatus = formatIter(meta.Current, meta.Max)
 			t.renderStatusBar()
 		}
 
 	case orchestrator.EventPlanning:
-		if strings.HasPrefix(event.Message, "Task:") {
-			t.output(formatTag("TASK", event.Message))
-		} else if strings.HasPrefix(event.Message, "Executing") {
-			t.output(formatTag("TOOLS", event.Message))
-		} else {
-			t.output(formatTag("PLAN", event.Message))
+		if strings.HasPrefix(event.Message, "Executing") {
+			if !t.toolsUsed {
+				t.toolsUsed = true
+			}
+			t.output(formatTools(event.Message))
 		}
 
 	case orchestrator.EventThinking:
 		msg := event.Message
 		if strings.HasPrefix(msg, "Reasoning: ") {
 			msg = strings.TrimPrefix(msg, "Reasoning: ")
+			t.lastStatus = "Reasoning"
+			t.output(formatThinking(msg))
+		} else if msg == "Analyzing tool results..." {
+			t.lastStatus = "Analyzing"
+			t.output(formatThink(msg))
 		}
-		t.lastStatus = "Thinking..."
-		t.output(formatSubtle("THINK", msg))
 
 	case orchestrator.EventToolCall:
+		t.inToolResult = true
+		t.toolResultBuffer.Reset()
 		var meta orchestrator.ToolCallMeta
 		if err := json.Unmarshal(event.Metadata, &meta); err == nil {
 			argsStr := formatArgs(meta.Args)
@@ -131,35 +147,51 @@ func (t *TUI) handleEvent(event orchestrator.AgentEvent) {
 				t.output(formatCallNoArgs(meta.ToolName))
 			}
 		} else {
-			t.output(formatSubtle("CALL", event.Message))
+			t.output(formatCallMsg(event.Message))
 		}
 
 	case orchestrator.EventToolResult:
-		t.lastStatus = event.Message
-		t.output(formatSubtle("OK", event.Message))
+		t.lastStatus = "Working"
+		t.inToolResult = false
+		t.output(formatResult(event.Message))
 
 	case orchestrator.EventToolError:
-		t.output(formatSubtle("ERR", event.Message))
+		t.inToolResult = false
+		t.output(formatError(event.Message))
 
 	case orchestrator.EventRetry:
 		var meta orchestrator.RetryMeta
 		if err := json.Unmarshal(event.Metadata, &meta); err == nil {
 			t.output(formatRetry(meta.ToolName, meta.Attempt, meta.MaxAttempts))
 			if meta.Error != "" {
-				t.output(formatError(meta.Error))
+				t.output(formatErrorMsg(meta.Error))
 			}
 		} else {
-			t.output(formatSubtle("RETRY", event.Message))
+			t.output(formatRetryMsg(event.Message))
 		}
 
 	case orchestrator.EventComplete:
 		elapsed := time.Since(t.taskStartTime)
-		t.output(formatDone(elapsed.Round(time.Second)))
-		t.lastStatus = "Ready"
-		t.renderStatusBar()
+		if t.toolsUsed {
+			t.output(formatDone(elapsed))
+		} else {
+			t.lastStatus = "Ready"
+		}
 
 	case orchestrator.EventStream:
-		t.output(event.Message)
+	}
+}
+
+func (t *TUI) streamOutput(content string) {
+	if content == "" {
+		return
+	}
+
+	if t.inToolResult {
+		t.toolResultBuffer.WriteString(content)
+		os.Stdout.WriteString(content)
+	} else {
+		t.streamRenderer.Stream(content)
 	}
 }
 
@@ -169,25 +201,37 @@ func (t *TUI) renderStatusBar() {
 		BorderForeground(lipgloss.Color("238")).
 		Padding(0, 1)
 
+	elapsed := time.Since(t.taskStartTime)
+	elapsedStr := formatDuration(elapsed)
+
 	statusContent := lipgloss.JoinHorizontal(
 		lipgloss.Left,
-		dimStyle.Render("Status: "),
+		dimStyle.Render("["),
 		accentStyle.Render(t.lastStatus),
+		dimStyle.Render("] "),
+		dimStyle.Render("Elapsed: "),
+		accentStyle.Render(elapsedStr),
 		dimStyle.Render(" | "),
-		dimStyle.Render("Task: "),
-		accentStyle.Render(truncateString(t.currentTask, 40)),
+		dimStyle.Render("Iter: "),
+		accentStyle.Render(strconv.Itoa(t.iteration)+"/"+strconv.Itoa(t.maxIterations)),
 	)
 
-	t.output("\n")
-	t.output(border.Render(statusContent))
-	t.output("\n")
+	newBar := border.Render(statusContent)
+	if newBar != t.lastStatusBar {
+		t.lastStatusBar = newBar
+		t.output("\n")
+		t.output(newBar)
+	}
 }
 
-func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
+func formatDuration(d time.Duration) string {
+	if d < time.Minute {
+		return d.Round(time.Second).String()
 	}
-	return s[:maxLen-3] + "..."
+	if d < time.Hour {
+		return d.Round(time.Second).String()
+	}
+	return d.Round(time.Minute).String()
 }
 
 func (t *TUI) handleInput(input string) {
@@ -219,8 +263,12 @@ func (t *TUI) executeTask(task string) {
 	t.currentTask = task
 	t.taskStartTime = time.Now()
 	t.iteration = 0
-	t.lastStatus = "Starting..."
-	t.output("\n[START] Executing task...")
+	t.toolsUsed = false
+	t.lastStatus = "Starting"
+	t.toolResultBuffer.Reset()
+	t.inToolResult = false
+	t.streamRenderer.Reset()
+	t.lastStatusBar = ""
 
 	ctx := context.Background()
 	_, _ = t.agent.Execute(ctx, task)
@@ -228,12 +276,12 @@ func (t *TUI) executeTask(task string) {
 
 func (t *TUI) showStatus() {
 	elapsed := time.Since(t.taskStartTime)
-	statusMsg := formatStatus(t.currentTask, elapsed.Round(time.Second), t.iteration, t.maxIterations, t.lastStatus)
+	statusMsg := formatStatus(t.currentTask, elapsed, t.iteration, t.maxIterations, t.lastStatus)
 	t.renderMarkdown(statusMsg)
 }
 
 func (t *TUI) showHelp() {
-	t.renderMarkdown("# Available Commands\n\n- /help - Show this help message\n- /clear - Clear the screen\n- /config - Show current configuration\n- /style - Show available markdown styles\n- /status - Show current task status\n- /exit or q - Exit the application\n\n## Agent Events\n\nThe agent will notify you about:\n- [TASK] Task planning\n- [THINK] Thinking/reasoning\n- [TOOLS] Tool execution\n- [OK] Tool results\n- [ERR] Tool errors\n- [RETRY] Retries")
+	t.renderMarkdown("# Available Commands\n\n- /help - Show this help message\n- /clear - Clear the screen\n- /config - Show current configuration\n- /style - Show available markdown styles\n- /status - Show current task status\n- /exit or q - Exit the application")
 }
 
 func (t *TUI) showConfig() {
@@ -241,7 +289,7 @@ func (t *TUI) showConfig() {
 }
 
 func (t *TUI) showStyles() {
-	t.renderMarkdown("# Available Markdown Styles\n\n- dark - Dark theme (default)\n- light - Light theme\n- pink - Pink theme\n- aurora - Aurora theme\n- notty - Notty theme\n- chocolate - Chocolate theme\n\nSet the GLAMOUR_STYLE environment variable to change the default style.")
+	t.renderMarkdown("# Available Markdown Styles\n\n- dark - Dark theme (default)\n- light - Light theme\n- pink - Pink theme\n- aurora - Aurora theme\n- notty - Notty theme\n- chocolate - Chocolate theme")
 }
 
 func (t *TUI) clearScreen() {
@@ -279,9 +327,9 @@ func (t *TUI) renderHeader() {
 
 func (t *TUI) printConnectionStatus() {
 	if t.connected {
-		t.output("[OK] Connected to " + string(t.cfg.Provider) + " at " + t.cfg.LLMEndpoint)
+		t.output(successStyle.Render("✓") + " " + dimStyle.Render("Connected to ") + accentStyle.Render(string(t.cfg.Provider)) + dimStyle.Render(" at ") + mutedStyle.Render(t.cfg.LLMEndpoint))
 	} else {
-		t.output("[WARN] Could not connect to " + string(t.cfg.Provider) + " at " + t.cfg.LLMEndpoint + " - continuing anyway")
+		t.output(warningStyle.Render("⚠") + " " + dimStyle.Render("Could not connect to ") + accentStyle.Render(string(t.cfg.Provider)))
 	}
 }
 
@@ -297,12 +345,8 @@ func (t *TUI) renderMarkdown(content string) {
 	if content == "" {
 		return
 	}
-	rendered, err := t.markdownRender.Render(content)
-	if err != nil || rendered == content {
-		t.output(content)
-		return
-	}
-	t.output(rendered)
+	rendered := md.Render(content, 80, 0)
+	os.Stdout.Write(rendered)
 }
 
 func formatArgs(args map[string]interface{}) string {
@@ -336,36 +380,60 @@ func formatValue(v interface{}) string {
 	}
 }
 
-func formatTag(tag, msg string) string {
-	return "\n[" + tag + "] " + msg
+func formatStart() string {
+	return "\n" + dimStyle.Render("[") + accentStyle.Render("START") + dimStyle.Render("] ") + dimStyle.Render("Executing task...\n")
 }
 
-func formatSubtle(tag, msg string) string {
-	return "  [" + tag + "] " + msg
+func formatIter(current, max int) string {
+	return "Iter " + strconv.Itoa(current) + "/" + strconv.Itoa(max)
+}
+
+func formatTools(msg string) string {
+	return "\n" + dimStyle.Render("→") + " " + accentStyle.Render(msg) + "\n"
+}
+
+func formatThink(msg string) string {
+	return dimStyle.Render("  ○ ") + thinkingStyle.Render(msg)
+}
+
+func formatThinking(msg string) string {
+	return dimStyle.Render("  ◐ ") + thinkingStyle.Render(msg) + "\n"
 }
 
 func formatCall(name, args string) string {
-	return "  [CALL] " + name + "(" + args + ")"
+	return dimStyle.Render("  ├─ ") + accentStyle.Render(name) + dimStyle.Render("("+args+")") + "\n"
 }
 
 func formatCallNoArgs(name string) string {
-	return "  [CALL] " + name
+	return dimStyle.Render("  ├─ ") + accentStyle.Render(name) + "\n"
+}
+
+func formatCallMsg(msg string) string {
+	return dimStyle.Render("  ├─ ") + msg + "\n"
+}
+
+func formatResult(msg string) string {
+	return dimStyle.Render("  └─ ") + successStyle.Render("✓") + " " + dimStyle.Render(msg) + "\n"
+}
+
+func formatError(msg string) string {
+	return dimStyle.Render("  └─ ") + errorStyle.Render("✗") + " " + errorStyle.Render(msg) + "\n"
+}
+
+func formatErrorMsg(err string) string {
+	return "    " + dimStyle.Render("Error: ") + err + "\n"
 }
 
 func formatRetry(name string, attempt, max int) string {
-	return "  [RETRY] " + name + " (attempt " + formatInt(attempt) + "/" + formatInt(max) + ")"
+	return dimStyle.Render("  └─ ") + warningStyle.Render("↻") + " " + dimStyle.Render(name+" (attempt "+strconv.Itoa(attempt)+"/"+strconv.Itoa(max)+")") + "\n"
 }
 
-func formatError(err string) string {
-	return "    Error: " + err
+func formatRetryMsg(msg string) string {
+	return dimStyle.Render("  └─ ") + warningStyle.Render("↻") + " " + msg + "\n"
 }
 
 func formatDone(d time.Duration) string {
-	return "\n[DONE] Task completed in " + d.String()
-}
-
-func formatIteration(current, max int) string {
-	return "Iteration " + formatInt(current) + "/" + formatInt(max)
+	return "\n" + dimStyle.Render("[") + successStyle.Render("DONE") + dimStyle.Render("] ") + dimStyle.Render("Completed in "+formatDuration(d)) + "\n"
 }
 
 func formatStatus(task string, elapsed time.Duration, iter, maxIter int, status string) string {
@@ -374,11 +442,11 @@ func formatStatus(task string, elapsed time.Duration, iter, maxIter int, status 
 	b.WriteString("- Task: ")
 	b.WriteString(task)
 	b.WriteString("\n- Elapsed: ")
-	b.WriteString(elapsed.String())
+	b.WriteString(formatDuration(elapsed))
 	b.WriteString("\n- Iteration: ")
-	b.WriteString(formatInt(iter))
+	b.WriteString(strconv.Itoa(iter))
 	b.WriteString("/")
-	b.WriteString(formatInt(maxIter))
+	b.WriteString(strconv.Itoa(maxIter))
 	b.WriteString("\n- Status: ")
 	b.WriteString(status)
 	return b.String()
@@ -394,19 +462,11 @@ func formatConfig(provider, model, endpoint string, ctxWindow int, temp float64,
 	b.WriteString("\n- Endpoint: ")
 	b.WriteString(endpoint)
 	b.WriteString("\n- Context Window: ")
-	b.WriteString(formatInt(ctxWindow))
+	b.WriteString(strconv.Itoa(ctxWindow))
 	b.WriteString(" tokens\n- Temperature: ")
-	b.WriteString(formatFloat(temp))
+	b.WriteString(strconv.FormatFloat(temp, 'f', 2, 64))
 	b.WriteString("\n- Timeout: ")
-	b.WriteString(formatInt(timeout))
+	b.WriteString(strconv.Itoa(timeout))
 	b.WriteString(" seconds")
 	return b.String()
-}
-
-func formatInt(n int) string {
-	return strings.TrimSpace(strconv.Itoa(n))
-}
-
-func formatFloat(f float64) string {
-	return strings.TrimSpace(strconv.FormatFloat(f, 'f', 2, 64))
 }
