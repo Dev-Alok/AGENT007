@@ -13,44 +13,49 @@ import (
 )
 
 const (
-	colorReset  = "\033[0m"
-	colorGreen  = "\033[32m"
-	colorCyan   = "\033[36m"
-	colorYellow = "\033[33m"
-	colorRed    = "\033[31m"
-	colorGrey   = "\033[90m"
-	colorBold   = "\033[1m"
+	Reset  = "\033[0m"
+	Bold   = "\033[1m"
+	Dim    = "\033[2m"
+
+	Green  = "\033[32m"
+	Yellow = "\033[33m"
+	Cyan   = "\033[36m"
+	Grey   = "\033[90m"
+	Red    = "\033[31m"
+	Purple = "\033[35m"
 )
 
 type TUI struct {
 	agent   *orchestrator.Agent
 	cfg     *config.AgentConfig
-	history []Message
 	done    chan struct{}
 }
 
 type Message struct {
-	Role     string
-	Content  string
-	Time     time.Time
-	ToolName string
+	Role      string
+	Content   string
+	Thinking  string
+	Time      time.Time
+	ToolName  string
+	ToolArgs  string
+	ToolResult string
 }
 
 func NewTUI(agent *orchestrator.Agent, cfg *config.AgentConfig) *TUI {
 	return &TUI{
-		agent:   agent,
-		cfg:     cfg,
-		history: []Message{},
-		done:    make(chan struct{}),
+		agent: agent,
+		cfg:   cfg,
+		done:  make(chan struct{}),
 	}
 }
 
 func (t *TUI) Run() error {
+	t.clearScreen()
 	t.renderHeader()
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
-		fmt.Printf("\n%s👤 You:\033[0m ", colorGreen)
+		fmt.Printf("\n%s%s➜%s ", Bold, Green, Reset)
 		if !scanner.Scan() {
 			close(t.done)
 			return nil
@@ -65,11 +70,14 @@ func (t *TUI) handleInput(input string) {
 	switch input {
 	case "exit", "quit":
 		close(t.done)
-	case "/help":
+	case "q":
+		close(t.done)
+	case "/help", "help":
 		t.showHelp()
-	case "/clear":
+	case "/clear", "clear":
 		t.clearScreen()
-	case "/config":
+		t.renderHeader()
+	case "/config", "config":
 		t.showConfig()
 	default:
 		if strings.TrimSpace(input) == "" {
@@ -80,44 +88,152 @@ func (t *TUI) handleInput(input string) {
 }
 
 func (t *TUI) executeTask(task string) {
-	t.history = append(t.history, Message{Role: "user", Content: task, Time: time.Now()})
+	// Clear previous thinking
+	t.agent.SetCurrentOutput("", "")
+	
+	fmt.Println()
+	fmt.Printf("%s%s◌ Thinking...%s\n", Dim, Yellow, Reset)
 
 	ctx := context.Background()
 	_, err := t.agent.Execute(ctx, task)
 	
+	// Get the thinking and content from agent
+	thinking, content := t.agent.GetCurrentOutput()
+	
+	// Display thinking if exists
+	if thinking != "" {
+		t.displayThinking(thinking)
+	}
+	
+	// Display content
+	if content != "" {
+		t.displayMessage("assistant", content)
+	} else if thinking == "" && content == "" {
+		// Task completed without content (like a simple acknowledgment)
+		fmt.Printf("\n%s%s✓ Done%s\n", Bold, Green, Reset)
+	}
+	
 	if err != nil {
-		t.history = append(t.history, Message{Role: "error", Content: err.Error(), Time: time.Now()})
+		t.displayMessage("error", err.Error())
 	}
 }
 
+func (t *TUI) displayThinking(thinking string) {
+	fmt.Printf("\n%s%s┌─ %s🤔 Thinking%s\n", Bold, Grey, Purple, Grey)
+	lines := wrapText(thinking, 65)
+	for _, line := range lines {
+		fmt.Printf("%s%s│%s %s%s\n", Bold, Grey, Reset, Dim, line)
+	}
+	fmt.Printf("%s%s└%s\n", Bold, Grey, Reset)
+}
+
+func (t *TUI) displayMessage(role, content string) {
+	var icon, iconColor, borderColor string
+	
+	switch role {
+	case "user":
+		icon, iconColor, borderColor = "👤", Green, Grey
+	case "assistant":
+		icon, iconColor, borderColor = "🤖", Cyan, Grey
+	case "tool":
+		icon, iconColor, borderColor = "🔧", Yellow, Grey
+	case "error":
+		icon, iconColor, borderColor = "✗", Red, Grey
+	default:
+		icon, iconColor, borderColor = "●", Cyan, Grey
+	}
+	
+	if role == "error" {
+		fmt.Printf("\n%s%s┌─ %sError%s\n", Bold, borderColor, iconColor, Grey)
+	} else {
+		fmt.Printf("\n%s%s┌─ %s%s %s%s\n", Bold, borderColor, iconColor, icon, Grey)
+	}
+	
+	lines := wrapText(content, 65)
+	for i, line := range lines {
+		if i == 0 {
+			fmt.Printf("%s%s│%s %s\n", Bold, borderColor, Reset, line)
+		} else {
+			fmt.Printf("%s%s │%s %s\n", Bold, borderColor, Reset, line)
+		}
+	}
+	fmt.Printf("%s%s└%s\n", Bold, borderColor, Reset)
+}
+
+func wrapText(text string, width int) []string {
+	if len(text) <= width {
+		return []string{text}
+	}
+	
+	var lines []string
+	words := strings.Fields(text)
+	currentLine := ""
+	
+	for _, word := range words {
+		if len(currentLine)+len(word)+1 > width {
+			if currentLine != "" {
+				lines = append(lines, currentLine)
+			}
+			currentLine = word
+		} else {
+			if currentLine != "" {
+				currentLine += " "
+			}
+			currentLine += word
+		}
+	}
+	if currentLine != "" {
+		lines = append(lines, currentLine)
+	}
+	
+	return lines
+}
+
 func (t *TUI) showHelp() {
-	fmt.Printf("\n%s📖 Help - Available Commands:\n", colorYellow)
-	fmt.Println("  • Type any task and press Enter to execute")
-	fmt.Println("  • /help    - Show this help message")
-	fmt.Println("  • /clear   - Clear the screen")
-	fmt.Println("  • /config  - Show current configuration")
-	fmt.Printf("%sTip: The agent uses tools automatically.%s\n", colorGrey, colorReset)
+	fmt.Printf("\n%s%s┌─ %s📖 Help%s\n", Bold, Grey, Yellow, Grey)
+	fmt.Printf("%s%s│%s\n", Bold, Grey, Reset)
+	fmt.Printf("%s%s│%s   %s/help%s      - Show this help\n", Bold, Grey, Reset, Green, Reset)
+	fmt.Printf("%s%s│%s   %s/clear%s    - Clear screen\n", Bold, Grey, Reset, Green, Reset)
+	fmt.Printf("%s%s│%s   %s/config%s    - Show configuration\n", Bold, Grey, Reset, Green, Reset)
+	fmt.Printf("%s%s│%s   %s/exit%s      - Exit\n", Bold, Grey, Reset, Green, Reset)
+	fmt.Printf("%s%s│%s   %s/q%s         - Exit (shortcut)\n", Bold, Grey, Reset, Green, Reset)
+	fmt.Printf("%s%s│%s\n", Bold, Grey, Reset)
+	fmt.Printf("%s%s│%s   Type your request and press Enter\n", Bold, Grey, Reset)
+	fmt.Printf("%s%s│%s   The agent will use tools automatically\n", Bold, Grey, Reset)
+	fmt.Printf("%s%s└%s\n", Bold, Grey, Reset)
 }
 
 func (t *TUI) clearScreen() {
-	t.history = nil
+	fmt.Print("\033[2J\033[H")
 }
 
 func (t *TUI) showConfig() {
-	fmt.Printf("\n%s⚙️ Current Configuration:\n", colorYellow)
-	fmt.Printf("  Provider:   %s\n", t.cfg.Provider)
-	fmt.Printf("  Model:      %s\n", t.cfg.Model)
-	fmt.Printf("  Endpoint:   %s\n", t.cfg.LLMEndpoint)
-	fmt.Printf("  Context:    %d tokens\n", t.cfg.ContextWindow)
-	fmt.Printf("  Temperature:%.2f\n", t.cfg.Temperature)
-	fmt.Printf("%sTimeout:      %ds%s\n\n", colorGrey, t.cfg.LLMTimeoutSeconds, colorReset)
+	fmt.Printf("\n%s%s┌─ %s⚙️ Configuration%s\n", Bold, Grey, Yellow, Grey)
+	fmt.Printf("%s%s│%s\n", Bold, Grey, Reset)
+	fmt.Printf("%s%s│%s   %sProvider:%s   %s%s\n", Bold, Grey, Reset, Dim, Reset, Cyan, t.cfg.Provider)
+	fmt.Printf("%s%s│%s   %sModel:%s      %s%s\n", Bold, Grey, Reset, Dim, Reset, Cyan, t.cfg.Model)
+	fmt.Printf("%s%s│%s   %sEndpoint:%s   %s%s\n", Bold, Grey, Reset, Dim, Reset, Cyan, t.cfg.LLMEndpoint)
+	fmt.Printf("%s%s│%s   %sContext:%s    %s%d tokens\n", Bold, Grey, Reset, Dim, Reset, Cyan, t.cfg.ContextWindow)
+	fmt.Printf("%s%s│%s   %sTemperature:%s %.2f\n", Bold, Grey, Reset, Dim, Reset, Cyan, t.cfg.Temperature)
+	fmt.Printf("%s%s│%s   %sTimeout:%s     %ds\n", Bold, Grey, Reset, Dim, Reset, Cyan, t.cfg.LLMTimeoutSeconds)
+	fmt.Printf("%s%s│%s\n", Bold, Grey, Reset)
+	fmt.Printf("%s%s└%s\n", Bold, Grey, Reset)
 }
 
 func (t *TUI) renderHeader() {
-	fmt.Println(colorBold + "╔══════════════════════════════════════════════════════╗")
-	fmt.Println("║    🤖 Agentic Coder - LM Studio Edition            ║")
-	fmt.Println("╚══════════════════════════════════════════════════════╝" + colorReset)
-	fmt.Printf("%sProvider:%s %s | %sModel:%s     %s\n", colorGrey, colorReset, t.cfg.Provider, colorReset, colorReset, t.cfg.Model)
-	fmt.Printf("%sEndpoint:%s  %s\n", colorGrey, colorReset, t.cfg.LLMEndpoint)
-	fmt.Println(colorGreen + "───────────────────────────────────────────────────────" + colorReset)
+	borderColor := Grey
+	accentColor := Cyan
+	
+	fmt.Printf("%s╔═══════════════════════════════════════════════════════════════════╗%s\n", borderColor, Reset)
+	fmt.Printf("%s║%s  %s🤖 Agentic Coder%s                                             %s║%s\n", borderColor, Reset, Bold+accentColor, Reset, borderColor, Reset)
+	fmt.Printf("%s║%s  %sLM Studio Edition%s                                         %s║%s\n", borderColor, Reset, Dim, Reset, borderColor, Reset)
+	fmt.Printf("%s╠═══════════════════════════════════════════════════════════════════╣%s\n", borderColor, Reset)
+	fmt.Printf("%s║%s  %sProvider:%s  %s%-12s  %sModel:%s     %s%-25s %s║%s\n", 
+		borderColor, Reset, Dim, Reset, Cyan, t.cfg.Provider, Dim, Reset, Cyan, t.cfg.Model, borderColor, Reset)
+	fmt.Printf("%s║%s  %sEndpoint:%s %s%-45s %s║%s\n", 
+		borderColor, Reset, Dim, Reset, Cyan, t.cfg.LLMEndpoint, borderColor, Reset)
+	fmt.Printf("%s╚═══════════════════════════════════════════════════════════════════╝%s\n", borderColor, Reset)
+	
+	fmt.Printf("\n%s%sCommands:%s /help %s| %s/clear %s| %s/config %s| %s/exit%s\n\n", 
+		Dim, Reset, Green, Dim, Reset, Green, Dim, Reset, Green, Reset)
 }

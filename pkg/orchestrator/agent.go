@@ -15,7 +15,6 @@ import (
 )
 
 // Agent manages the conversation state and implements the Thought->Action->Observation loop.
-// Uses channels for concurrent tool execution to prevent blocking (Go concurrency pattern).
 type Agent struct {
 	registry      *tools.Registry
 	llmClient     *llm.Client
@@ -23,17 +22,19 @@ type Agent struct {
 	contextWindow int
 	maxIterations int
 
-	mu           sync.RWMutex // Protects conversation state
+	mu           sync.RWMutex
 	conversation []Message
 
-	reflectionAttempts map[string]int // Track retry attempts per error pattern
-	outputCallback     func(string)   // Callback for streaming output
+	reflectionAttempts map[string]int
+	currentThinking    string
+	currentContent     string
 }
 
 // Message represents a chat message in the conversation history.
 type Message struct {
 	Role      string         `json:"role"`
 	Content   string         `json:"content"`
+	Thinking  string         `json:"thinking,omitempty"`
 	ToolCalls []llm.ToolCall `json:"tool_calls,omitempty"`
 	ToolName  string         `json:"tool_name,omitempty"`
 }
@@ -47,7 +48,6 @@ func NewAgent(registry *tools.Registry, cfg *config.AgentConfig) *Agent {
 		contextWindow:      cfg.ContextWindow,
 		maxIterations:      5,
 		reflectionAttempts: make(map[string]int),
-		outputCallback:     nil,
 	}
 }
 
@@ -60,15 +60,27 @@ func NewAgentWithTimeout(registry *tools.Registry, cfg *config.AgentConfig, time
 		contextWindow:      cfg.ContextWindow,
 		maxIterations:      5,
 		reflectionAttempts: make(map[string]int),
-		outputCallback:     nil,
 	}
 }
 
-// SetOutputCallback sets a callback function for streaming output.
-func (a *Agent) SetOutputCallback(callback func(string)) {
+// SetOutputCallback sets a callback function for streaming output (thinking, content).
+func (a *Agent) SetOutputCallback(callback func(string, string)) {
+	// Deprecated: keeping for compatibility
+}
+
+// GetCurrentOutput returns the current thinking and content
+func (a *Agent) GetCurrentOutput() (string, string) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.currentThinking, a.currentContent
+}
+
+// SetCurrentOutput sets the current thinking and content
+func (a *Agent) SetCurrentOutput(thinking, content string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.outputCallback = callback
+	a.currentThinking = thinking
+	a.currentContent = content
 }
 
 // SetModel allows changing the LLM model at runtime.
@@ -313,8 +325,10 @@ func (a *Agent) getLLMResponseStream(ctx context.Context, finalOutput *strings.B
 	go a.llmClient.StreamChat(ctx, a.model, llmMessages, false, resultChan, errChan)
 
 	var fullResponse strings.Builder
+	var fullThinking strings.Builder
 	var finalChunk *llm.ChatResponse
 	formattedThinking := false
+	var hasContent bool
 
 	for {
 		select {
@@ -326,35 +340,46 @@ func (a *Agent) getLLMResponseStream(ctx context.Context, finalOutput *strings.B
 			return fullResponse.String(), toolCalls, nil
 		case resp, ok := <-resultChan:
 			if !ok {
-				// Channel closed, streaming complete
 				toolCalls, _ := llm.ExtractToolCalls(finalChunk)
 				return fullResponse.String(), toolCalls, nil
 			}
 
 			finalChunk = resp
 
-			newContent := strings.TrimPrefix(resp.Message.Content, fullResponse.String())
-			fullResponse.WriteString(newContent)
-			finalOutput.WriteString(newContent)
-
-			if a.outputCallback != nil {
-				a.mu.RLock()
-				callback := a.outputCallback
-				a.mu.RUnlock()
-				if callback != nil {
-					callback(newContent)
-				}
+			// Get content from response - check both reasoning_content and content
+			newContent := ""
+			newThinking := ""
+			
+			if resp.Message.Content != "" {
+				newContent = strings.TrimPrefix(resp.Message.Content, fullResponse.String())
+				hasContent = true
+			} else if resp.Message.ReasoningContent != "" {
+				newThinking = strings.TrimPrefix(resp.Message.ReasoningContent, fullThinking.String())
 			}
 
-			if !formattedThinking {
-				fmt.Println()
-				fmt.Print("\033[36m🤖 Assistant:\033[0m ")
-				finalOutput.WriteString("\n🤖 Assistant: ")
+			if newThinking != "" {
+				fullThinking.WriteString(newThinking)
+			}
+			if newContent != "" {
+				fullResponse.WriteString(newContent)
+			}
+			finalOutput.WriteString(newContent)
+
+			// Call callback with both thinking and content
+			a.mu.Lock()
+			a.currentThinking = fullThinking.String()
+			a.currentContent = fullResponse.String()
+			a.mu.Unlock()
+
+			if !formattedThinking && !hasContent && fullThinking.Len() > 0 {
+				fmt.Print("\n\033[35m🤔 Thinking...\033[0m\n")
 				formattedThinking = true
 			}
 
 			// Print with immediate flush
-			fmt.Print(newContent)
+			if newContent != "" {
+				fmt.Print(newContent)
+			}
 		case <-ctx.Done():
 			return fullResponse.String(), nil, ctx.Err()
 		}
