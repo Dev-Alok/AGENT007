@@ -75,22 +75,12 @@ func (t *TUI) print(content string) {
 		return
 	}
 
-	// Try to render as markdown first
-	cleanContent := strings.TrimSpace(content)
-	cleanContent = strings.ReplaceAll(cleanContent, "\r\n", "\n")
+	// Don't trim newlines - preserve them for proper streaming output
+	cleanContent := strings.ReplaceAll(content, "\r\n", "\n")
 
-	rendered := cleanContent
-	if t.markdownRender != nil {
-		out, err := t.markdownRender.Render(cleanContent)
-		if err == nil && out != "" && out != cleanContent {
-			rendered = out
-		} else {
-			// Fall back to simple formatting
-			rendered = renderer.FormatSimple(cleanContent)
-		}
-	}
-
-	fmt.Print(rendered)
+	// For streaming output, just print directly without markdown rendering
+	// The full response will be rendered when complete
+	fmt.Print(cleanContent)
 }
 
 func (t *TUI) handleInput(input string) {
