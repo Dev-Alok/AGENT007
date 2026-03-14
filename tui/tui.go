@@ -114,8 +114,12 @@ func (t *TUI) handleEvent(event orchestrator.AgentEvent) {
 		}
 
 	case orchestrator.EventThinking:
-		t.lastStatus = event.Message
-		t.output(formatSubtle("THINK", event.Message))
+		msg := event.Message
+		if strings.HasPrefix(msg, "Reasoning: ") {
+			msg = strings.TrimPrefix(msg, "Reasoning: ")
+		}
+		t.lastStatus = "Thinking..."
+		t.output(formatSubtle("THINK", msg))
 
 	case orchestrator.EventToolCall:
 		var meta orchestrator.ToolCallMeta

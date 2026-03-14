@@ -206,10 +206,10 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 	a.mu.Unlock()
 
 	a.emitWithMeta(EventStatus, "Starting agent execution...", IterationMeta{Current: 0, Max: a.maxIterations})
-	a.emitWithMeta(EventPlanning, fmt.Sprintf("Task: %s", task), nil)
 
 	var finalOutput strings.Builder
 	var iteration int
+	var toolsUsed bool
 
 	for i := 0; i < a.maxIterations; i++ {
 		select {
@@ -220,8 +220,6 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 		}
 
 		iteration = i + 1
-		a.emitWithMeta(EventIteration, fmt.Sprintf("Iteration %d/%d", iteration, a.maxIterations), IterationMeta{Current: iteration, Max: a.maxIterations})
-		a.emitWithMeta(EventThinking, "Analyzing task and planning next step...", nil)
 
 		response, toolCalls, err := a.getLLMResponseStream(ctx, &finalOutput, a.streamCallback)
 		if err != nil {
@@ -245,10 +243,20 @@ func (a *Agent) Execute(ctx context.Context, task string) (string, error) {
 			a.reflectionAttempts = make(map[string]int)
 			a.mu.Unlock()
 
-			a.emitWithMeta(EventComplete, "Task completed successfully", nil)
+			if !toolsUsed {
+				a.emitWithMeta(EventComplete, "Task completed successfully", nil)
+			} else {
+				a.emitWithMeta(EventComplete, "Task completed successfully", nil)
+			}
 			break
 		}
 
+		if !toolsUsed {
+			toolsUsed = true
+			a.emitWithMeta(EventPlanning, fmt.Sprintf("Task: %s", task), nil)
+		}
+
+		a.emitWithMeta(EventIteration, fmt.Sprintf("Iteration %d/%d", iteration, a.maxIterations), IterationMeta{Current: iteration, Max: a.maxIterations})
 		a.emitWithMeta(EventPlanning, fmt.Sprintf("Executing %d tool(s): %s", len(toolCalls), formatToolNames(toolCalls)), nil)
 
 		var wg sync.WaitGroup
@@ -440,6 +448,7 @@ func (a *Agent) getLLMResponseStream(ctx context.Context, finalOutput *strings.B
 				if callback != nil {
 					callback(newThinking)
 				}
+				a.emitWithMeta(EventThinking, "Reasoning: "+newThinking, nil)
 			}
 
 			if newContent != "" {
